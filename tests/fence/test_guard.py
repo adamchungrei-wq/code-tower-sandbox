@@ -112,6 +112,8 @@ def test_shell_writes_to_rules_blocked_on_tower_branch_only():
 def test_parser_edge_cases():
     assert not bash("echo $(gh pr merge 3)")
     assert not bash("echo `gh pr merge 3`")
+    assert not bash('echo "$(gh pr merge 3)"')
+    assert not bash('X="$(git push --force origin tower/e1)"')
     assert not bash("git push origin 'tower/e1")          # can't be parsed safely: blocked
     assert bash("python3 -I checks/run_checks.py 2>/dev/null")
     assert bash("git log --oneline | head -5")

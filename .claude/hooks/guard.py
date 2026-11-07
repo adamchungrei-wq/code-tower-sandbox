@@ -34,6 +34,13 @@ SECRET_IN_CMD = re.compile(r"(^|[\s/'\"=])(\.env\b|[\w.-]*\.pem\b|id_rsa|credent
                            re.I)
 RM_RF = re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-r\s+-f|-f\s+-r)\b")
 WEB_CMD = re.compile(r"(^|[\s;&|(])(curl|wget)\b")
+# Never allowed anywhere in a command, whatever the quoting (catches $(...) and `...` inside other commands).
+RAW_BLOCK = (
+    (re.compile(r"\bgh\s+pr\s+(merge|ready|review|close|edit)\b"), "gh pr merge / ready / review / close / edit"),
+    (re.compile(r"\bgh\s+api\b[^\n]*(/merges?\b|/ccr/|\bgraphql\b)"), "GitHub merge, ready or GraphQL routes"),
+    (re.compile(r"\bgit\s+push\b[^\n]*(--force|\s-f\b|--delete|\s-d\b|\s:\S|--mirror|--all|\bmain\b)"),
+     "force, delete, mirror or main pushes"),
+)
 GH_REPO_PATH = re.compile(r"^/?repos/([^/]+)/([^/?#]+)(/[^?#]*)?(\?.*)?$")
 GH_VALUE_FLAGS = {"-H", "--header", "--jq", "-q", "--template", "-t", "--hostname", "--cache", "-p", "--preview"}
 GH_FIELD_FLAGS = {"-f", "-F", "--field", "--raw-field"}
@@ -146,7 +153,7 @@ def _gh(args, repo):
 
 def _segments(cmd):
     """Split a shell command into simple commands, respecting quotes. None if it can't be parsed."""
-    lexer = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(cmd.replace("\n", " ; ").replace("`", " ; "), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
         toks = list(lexer)
@@ -230,6 +237,9 @@ def _bash(cmd, cwd, branch_of, toplevel_of, repo_of):
         return False, "commands touching .env or credential files are blocked"
     if WEB_CMD.search(cmd):
         return False, "curl and wget are blocked: no web access from a Code Tower repo"
+    for pattern, what in RAW_BLOCK:
+        if pattern.search(cmd):
+            return False, f"{what} are blocked"
     segments = _segments(cmd)
     if segments is None:
         if re.search(r"\b(gh|git)\b", cmd):
