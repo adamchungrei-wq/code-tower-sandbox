@@ -78,3 +78,26 @@ def test_claimed_ids_from_ls_remote():
     heads = ("a1\trefs/heads/tower/e1\nb2\trefs/heads/claude/tower-e10\nc3\trefs/heads/feature/x\n"
              "d4\trefs/heads/tower/e10-retry\n")
     assert select_rows.claimed_ids(heads) == {"E1", "E10"}
+
+
+def test_a_branch_left_without_a_pr_comes_back_as_a_recover_row():
+    branches = {"E1": ["tower/e1"]}
+    out = select_rows.select(report(), {"E1"}, RULES, prs=[], now=NOW, claimed_branches=branches)
+    first = out["selected"][0]
+    assert first["id"] == "E1" and first["mode"] == "recover" and first["branch"] == "tower/e1"
+    assert len(out["selected"]) == 3                          # recover shares the room with fresh rows
+
+
+def test_open_or_closed_prs_stop_recovery():
+    branches = {"E1": ["tower/e1"]}
+    open_pr = select_rows.select(report(), {"E1"}, RULES, prs=[pr(7, "tower/e1")], now=NOW, claimed_branches=branches)
+    assert "E1" not in ids(open_pr["selected"]) and any("open PR" in s["why"] for s in open_pr["skipped"])
+    closed = select_rows.select(report(), {"E1"}, RULES, prs=[pr(7, "tower/e1", state="closed")], now=NOW,
+                                claimed_branches=branches)
+    assert "E1" not in ids(closed["selected"]) and any("closed" in s["why"] for s in closed["skipped"])
+
+
+def test_return_rows_without_a_pr_number_are_rejected():
+    ret = [{"id": "E2", "title": "x", "pr": None, "branch": "tower/e2"}]
+    out = select_rows.select(report(), {"E2"}, RULES, returns=ret, prs=[], now=NOW)
+    assert all(r["source"] != "return" for r in out["selected"])

@@ -16,7 +16,9 @@ Check, in order:
 4. No secrets, no network calls, no new dependencies.
 5. The PR summary has What changed (plain English), Risks, How to test and Undo, and `Adam approves merge` on its own line after the Undo section.
 
-Write ONE JSON object to the output path you're given (under `runs/ct/`):
+Your final message is ONE JSON object, nothing else (the tower saves it; you write no files):
 `{"pass": true|false, "problems": ["≤ 1 line each, fixable"], "items": [{"item": "1".."5", "met": true|false, "note": "..."}], "review_note": "≤ 6 short lines for Adam: what it does, what you checked, anything worth a look"}`
+
+Type commands exactly as plain words: no `$`, variables, `$(…)`, backticks, `~` or `&&` chains (the fence refuses them).
 
 `pass` is true only if items 1, 3, 4 and 5 are met and item 2 has no real problem.

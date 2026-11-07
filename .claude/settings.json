@@ -28,11 +28,10 @@
       "Bash(git rev-parse*)",
       "Bash(git branch*)",
       "Bash(git worktree *)",
-      "Bash(git push -u origin tower/*)",
-      "Bash(git push origin HEAD:tower/*)",
+      "Bash(git push -u origin HEAD:refs/heads/tower/*)",
       "Bash(git push origin HEAD:refs/heads/tower/*)",
-      "Bash(git push -u origin claude/tower-*)",
-      "Bash(git push origin HEAD:claude/tower-*)",
+      "Bash(git push -u origin HEAD:refs/heads/claude/tower-*)",
+      "Bash(git push origin HEAD:refs/heads/claude/tower-*)",
       "Bash(gh api repos/*)",
       "Bash(gh auth status)"
     ],
@@ -107,6 +106,13 @@
       "Bash(pip *)",
       "Bash(env*)",
       "Bash(printenv*)",
+      "Bash(export*)",
+      "Bash(set *)",
+      "Bash(declare*)",
+      "Bash(typeset*)",
+      "Bash(git branch origin/*)",
+      "Bash(git tag*)",
+      "Bash(git rebase*)",
       "Bash(curl *)",
       "Bash(wget *)",
       "Bash(ssh *)",
@@ -150,7 +156,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(mktemp) || exit 2; git -C \"$CLAUDE_PROJECT_DIR\" show origin/main:.claude/hooks/guard.py > \"$f\" 2>/dev/null || cp \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\" \"$f\" || { rm -f \"$f\"; exit 2; }; python3 -I \"$f\"; rc=$?; rm -f \"$f\"; [ \"$rc\" -eq 0 ] || exit 2"
+            "command": "f=$(mktemp) || exit 2; git -C \"$CLAUDE_PROJECT_DIR\" show refs/remotes/origin/main:.claude/hooks/guard.py > \"$f\" 2>/dev/null || cp \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\" \"$f\" || { rm -f \"$f\"; exit 2; }; python3 -I \"$f\"; rc=$?; rm -f \"$f\"; [ \"$rc\" -eq 0 ] || exit 2"
           }
         ]
       }

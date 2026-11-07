@@ -39,6 +39,21 @@ SECRET_FILE = re.compile(r"(^|/)(\.env(\.[^/]*)?|[^/]*\.pem|[^/]*\.key|id_rsa[^/
 HEADER = re.compile(r"^(\+\+\+|---) (a/|b/|/dev/null)")
 
 
+SUSPICIOUS = re.compile(r"\b(os\._exit|sys\.exit|SystemExit|atexit|sys\.argv|sys\.modules|__builtins__|builtins|"
+                        r"subprocess|socket|urllib|http\.client|importlib|ctypes|exec\(|eval\(|__import__)")
+
+
+def suspicious_src_lines(diff):
+    """Added lines under src/ that could fake a check (exit early, read argv, patch imports) or reach the network."""
+    current, found = "", []
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            current = line[4:].removeprefix("b/")
+        elif line.startswith("+") and not HEADER.match(line) and current.startswith("src/") and SUSPICIOUS.search(line):
+            found.append(f"{current}: {line[1:].strip()[:60]}")
+    return found
+
+
 def is_tamper(path, tamper):
     for item in tamper:
         if item.endswith("/"):
@@ -80,6 +95,10 @@ def problems(branch, files, diff, body, rules, labels=()):
         changed = len(added) + len(removed)
         if changed > cap:
             out.append(f"{changed} changed lines; row PRs are capped at {cap}")
+        flagged = suspicious_src_lines(diff)
+        if flagged:
+            out.append("a row PR adds code that exits early, reads argv, or reaches the network or imports "
+                       "(Adam reads it before any merge): " + "; ".join(flagged[:3]))
     for heading in REQUIRED:
         if heading not in body:
             out.append(f"the PR summary is missing '{heading}'")

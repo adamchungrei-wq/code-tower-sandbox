@@ -68,3 +68,10 @@ def test_tool_footer_after_the_approval_line_is_fine():
 def test_approval_must_be_its_own_line_after_undo():
     body = BODY.replace("\nAdam approves merge", "\nWe hope Adam approves merge soon")
     assert any("Adam approves merge" in p for p in problems("tower/e1", ["src/textkit/slug.py"], body=body))
+
+
+def test_row_code_that_could_fake_a_check_is_flagged():
+    diff = ("--- /dev/null\n+++ b/src/textkit/zz_helpers.py\n+import os, sys\n+print(sys.argv[0])\n+os._exit(0)\n")
+    found = problems("tower/e1", ["src/textkit/zz_helpers.py"], diff=diff)
+    assert any("exits early" in p for p in found)
+    assert problems("tower/e1", ["src/textkit/slug.py"]) == []

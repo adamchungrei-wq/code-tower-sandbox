@@ -1,26 +1,23 @@
-"""PreToolUse guard for a Code Tower repo. V0.2, hardened after the independent audit of 2026-11-07.
+"""PreToolUse guard for a Code Tower repo. V0.3: allow-lists, after two independent audits (2026-11-07).
 
 .claude/settings.json allows or denies tools by name; this hook looks inside each call. The hook command in
-settings.json runs MAIN's committed copy of this file when main has one, so editing the working file changes
-nothing. Exit 0 = allow (the normal permission rules still apply) · exit 2 = block, reason on stderr. Any
-error blocks. Hooks also run when a scheduled run auto-approves tools, so this is the fence that holds at night.
+settings.json runs the copy committed on refs/remotes/origin/main when there is one, so editing the working file
+changes nothing. Exit 0 = allow (the normal permission rules still apply) · exit 2 = block, reason on stderr.
+Any error blocks. Hooks also run when a scheduled run auto-approves tools.
 
-Principles
-1. The loop's own rules (PROTECTED) are never written from a tower or worker run, on any branch. Rules change
-   only through a PR made outside the tower (chat 04, or Adam on GitHub) that Adam merges.
-2. Anything that reaches GitHub or a git remote is allowed only in an exact shape:
-     git push [-u] origin <row branch>        git push origin HEAD:[refs/heads/]<row branch>
-     gh auth status
-     gh api repos/<this repo>/<route> [--jq EXPR] [--paginate] [-X GET -f state=… -f per_page=…]    (read)
-     gh api repos/<this repo>/pulls -X POST -f title=… -f head=<row branch> -f base=main -F draft=true
-            -F body=@runs/ct/<file>.md [--jq EXPR]                                                  (draft PR)
-     gh api repos/<this repo>/issues/<n>/comments -X POST -F body=@runs/ct/<file>.md [--jq EXPR] (comment)
-   A push is also refused when the branch's diff from origin/main touches PROTECTED.
-3. No secrets: secret and credential files are never read, searched, written, printed or posted.
-4. No web, closed inputs: no curl/wget/ssh; MCP tools are denied except Notion fetch/search/query and creating
-   one page in the Coordination Entries data source.
-Known gap (disclosed in PR #1): code a worker writes and runs (a test, say) can still do anything the
-session's own credentials allow. Only GitHub branch protection (public repo or a paid plan) closes that.
+Principles: allow what the tower needs, in listed shapes; refuse everything else.
+1. Tools: only the listed built-in tools, Notion fetch/search/query, and one Notion page in the Coordination
+   Entries data source. Anything else, any other app, and the web are refused.
+2. Shell: only listed command words. No `$`, backticks, `~`, globs in command words, inline-code runners,
+   wrappers, environment printing or `export`. git and gh only in listed shapes (below).
+3. The loop's own rules (PROTECTED), anything under a `.git` folder, and files outside a git checkout or /tmp
+   are never written from a tower or worker run, on any branch.
+4. git push only as `git push [-u] origin HEAD:[refs/heads/]<row branch>` (an explicit destination, which git
+   never remaps), refused if the branch changes PROTECTED or if git config redirects pushes.
+   gh only as `gh auth status`, REST reads, one draft-PR shape and one comment shape on this repo.
+5. No secrets: credential files, /proc, home dotfiles and secret-like text in bodies and entries are refused.
+Known gap (disclosed in PR #1): code a worker writes and runs (a test, say) can do anything the session's own
+credentials allow. Only GitHub branch protection (a public repo or a paid plan) closes that.
 """
 import json
 import os
@@ -30,13 +27,28 @@ import subprocess
 import sys
 from pathlib import Path
 
+MAIN = "refs/remotes/origin/main"
 COORD_DS = "eb8da925-cf1c-4689-af1d-830f77fc5e96"
 PROTECTED = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/", ".claude/agents/",
-             ".claude/skills/", ".claude/commands/", ".github/", ".git/", ".gitignore", "rules/", "checks/",
-             "tower/", "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml")
+             ".claude/skills/", ".claude/commands/", ".claude/CLAUDE.md", ".github/", ".gitignore", ".mcp.json",
+             "rules/", "checks/", "tower/", "tests/fence/", "PLAN.md", "CLAUDE.md", "CLAUDE.local.md",
+             "pyproject.toml")
 ROW_BRANCH = re.compile(r"^(tower/|claude/tower-)[a-z0-9]+$")
 BODY_FILE = re.compile(r"^(\./)?runs/ct/[A-Za-z0-9_.-]+\.md$|^/.+/runs/ct/[A-Za-z0-9_.-]+\.md$")
+MARKER = "<!-- code-tower -->"
 GH_GET_FIELDS = {"state", "per_page", "page", "sort", "direction"}
+BUILTIN_TOOLS = {"Read", "Grep", "Glob", "LS", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "BashOutput",
+                 "KillShell", "KillBash", "Agent", "Task", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
+                 "TaskOutput", "TaskStop", "TodoWrite", "SendMessage", "Skill", "ToolSearch", "ExitPlanMode",
+                 "EnterPlanMode", "AskUserQuestion", "Monitor", "SlashCommand"}
+SHELL_HEADS = {"date", "mkdir", "ls", "cat", "head", "tail", "wc", "grep", "diff", "cmp", "echo", "printf", "git",
+               "gh", "python3", "python", "cd", "pwd", "true", "false", "sort", "uniq", "tr", "cut", "nl", "basename",
+               "dirname", "realpath", "stat", "file", "which", "comm", "fold"}
+READERS = {"ls", "cat", "head", "tail", "wc", "grep", "diff", "cmp", "sort", "uniq", "nl", "stat", "file", "comm",
+           "realpath", "cut", "fold"}
+GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "add", "commit", "switch", "checkout", "restore", "fetch",
+                   "ls-remote", "rev-parse", "branch", "worktree", "push", "rm", "mv", "merge-base",
+                   "ls-files", "blame", "shortlog", "describe", "cat-file", "grep"}
 SECRETS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -49,36 +61,16 @@ SECRETS = (
 )
 SECRET_PATH = re.compile(
     r"(^|/)(\.env(\.[^/]*)?|[^/]*\.env|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|"
-    r"\.credentials\.json|settings\.local\.json|\.git-credentials|\.netrc|\.npmrc|\.pypirc|hosts\.yml)$"
-    r"|(^|/)(\.ssh|\.aws|\.docker|\.gnupg|\.config/gh)(/|$)", re.I)
-SECRET_IN_CMD = re.compile(
-    r"(\.e[n?*\[]|\.pem\b|\.key\b|id_rsa|id_ed25519|credentials|\.netrc|\.npmrc|\.pypirc|\.ssh\b|\.aws\b|"
-    r"\.docker\b|\.gnupg|\.config/gh|hosts\.yml|settings\.local\.json)", re.I)
-RM_RF = re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-r\s+-f|-f\s+-r)\b")
-# Never allowed anywhere in a command, whatever the quoting.
-RAW_BLOCK = (
-    (re.compile(r"\bgh\s+pr\s+(merge|ready|review|close|edit)\b"), "gh pr merge / ready / review / close / edit"),
-    (re.compile(r"\bgh\s+api\b[^\n]*(/merges?\b|/ccr/|\bgraphql\b)"), "GitHub merge, ready or GraphQL routes"),
-    (re.compile(r"\bgit\b[^\n]*\bpush\b[^\n]*(--force|\s-f\b|--delete|\s-d\b|\s:\S|--mirror|--all|\bmain\b)"),
-     "force, delete, mirror or main pushes"),
-)
-WEB_HEADS = {"curl", "wget", "nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp", "rsync", "ftp", "socat",
-             "lynx", "w3m", "aria2c", "http", "https"}
-WRAPPERS = {"env", "printenv", "xargs", "eval", "exec", "sudo", "doas", "su", "command", "builtin", "nohup",
-            "timeout", "nice", "stdbuf", "time", "watch", "bash", "sh", "zsh", "dash", "fish", "ksh", "busybox",
-            "parallel", "script", "nsenter", "chroot", "source", "."}
-WRITERS = {"tee", "mv", "cp", "rm", "rmdir", "truncate", "chmod", "chown", "touch", "ln", "install", "dd",
-           "patch", "unzip", "tar", "cpio", "mkdir", "shred"}
-GIT_BLOCKED = {"config", "remote", "send-pack", "update-ref", "symbolic-ref", "filter-branch", "filter-repo",
-               "replace", "apply", "am", "submodule", "credential", "credential-store", "daemon", "http-push",
-               "fast-import", "hook", "bundle", "archive", "request-pull", "notes"}
+    r"\.credentials\.json|\.claude\.json|settings\.local\.json|\.git-credentials|\.netrc|\.npmrc|\.pypirc|"
+    r"hosts\.yml)$|(^|/)(\.ssh|\.aws|\.docker|\.gnupg|\.config/gh)(/|$)|^/proc(/|$)|^/sys(/|$)", re.I)
+PYTEST_ARG = re.compile(r"^(-q|-x|-v|-vv|--tb=(short|line|no)|tests(/[A-Za-z0-9_./-]*)?(::[A-Za-z0-9_]+)*)$")
 PY_SHAPES = (
-    re.compile(r"^python3? -I -m pytest( .*)?$"),
-    re.compile(r"^python3? -I checks/[a-z0-9_]+\.py( .*)?$"),
-    re.compile(r"^python3? -I tower/[a-z0-9_]+\.py( .*)?$"),
+    re.compile(r"^python3? -I checks/[a-z0-9_]+\.py( --(only|plan|strict)( [A-Za-z0-9_./-]+)?)*$"),
+    re.compile(r"^python3? -I tower/[a-z0-9_]+\.py( [A-Za-z0-9_./=-]+)*$"),
     re.compile(r"^python3? -m pip install --quiet pytest$"),
 )
-REDIRECTS = {">", ">>", "<", "<<", "<<<", ">|", "&>", "&>>"}
+REDIRECTS = {">", ">>", "<", ">|", "&>", "&>>"}
+MAX_TOKENS = 200
 
 
 def block(why):
@@ -111,8 +103,9 @@ class Env:
         return out.strip() if out else ""
 
     def main_file(self, top, rel):
-        """A file as committed on origin/main (falls back to the working copy before main has it)."""
-        out = self._git(["show", f"origin/main:{rel}"], top)
+        """A file as committed on origin/main (full ref, so a local branch named origin/main can't shadow it);
+        the working copy before main has it."""
+        out = self._git(["show", f"{MAIN}:{rel}"], top)
         if out is not None:
             return out
         try:
@@ -134,8 +127,21 @@ class Env:
         return PROTECTED + tuple(str(p) for p in self.rules(path).get("tamper_paths", ()))
 
     def diff_names(self, where, src):
-        out = self._git(["diff", "--name-only", "--no-renames", f"origin/main...{src}"], where)
+        out = self._git(["diff", "--name-only", "--no-renames", f"{MAIN}...{src}"], where)
         return None if out is None else [l.strip() for l in out.splitlines() if l.strip()]
+
+    def push_redirects(self, where):
+        """Git config that could send a push somewhere else ('' if none; None if git can't answer).
+        Claude Code's cloud sessions inject `url.https://github.com/.insteadof git@github.com:` (and the ssh:// form):
+        those only rewrite GitHub SSH addresses to GitHub HTTPS, so they are allowed. Anything else is not."""
+        out = self._git(["config", "--get-regexp",
+                         r"^(remote\.origin\.(push|pushurl|mirror)|url\..*\.(insteadof|pushinsteadof)|core\.hookspath)$"],
+                        where)
+        if out is None:
+            probe = self._git(["rev-parse", "--git-dir"], where)
+            return "" if probe is not None else None      # no matches is exit 1: fine if it's a repo
+        benign = re.compile(r"^url\.https://github\.com/\.insteadof (git@github\.com:|ssh://git@github\.com/)$")
+        return "\n".join(l for l in out.splitlines() if l.strip() and not benign.match(l.strip()))
 
     def read(self, path):
         try:
@@ -145,38 +151,67 @@ class Env:
 
 
 def is_protected(rel, protected=PROTECTED):
+    """True if a repo-relative path is a protected item, sits inside one, or contains one ('.', '.claude', 'tests')."""
     rel = os.path.normpath(rel.replace("\\", "/")).replace("\\", "/")
     if rel.startswith("../") or rel == "..":
         return False
+    low = rel.lower()
+    if low == ".":
+        return True
     for item in protected:
-        if item.endswith("/"):
-            if rel == item[:-1] or rel.startswith(item):
-                return True
-        elif rel == item:
+        it = item.lower()
+        base = it[:-1] if it.endswith("/") else it
+        if low == base or (it.endswith("/") and low.startswith(it)) or base.startswith(low + "/"):
             return True
     return False
 
 
-def _rel_in_repo(path, cwd, env):
-    """(toplevel, repo-relative path) for a path, or ("", "") when it isn't inside a repo."""
+def _has_git_part(path):
+    return ".git" in [p.lower() for p in Path(os.path.normpath(path)).parts]
+
+
+def _full(path, cwd, env):
     raw = path.strip("'\"")
     full = raw if os.path.isabs(raw) else os.path.join(cwd or env.project_dir or ".", raw)
-    full = os.path.normpath(full)
-    top = env.toplevel(full) or ""
+    try:
+        return os.path.realpath(full)          # follow symlinks, so src/c -> ../checks still counts as checks
+    except OSError:
+        return os.path.normpath(full)
+
+
+def _write_refused(path, cwd, env):
+    """Why a write to `path` is refused, or '' if it's allowed."""
+    full = _full(path, cwd, env)
+    if SECRET_PATH.search(full) or SECRET_PATH.search(path):
+        return "secret or credential files are never written"
+    if _has_git_part(path) or _has_git_part(full):
+        return "nothing under a .git folder is written (git config, hooks and refs stay as they are)"
+    top = env.toplevel(full)
     if not top:
-        return "", ""
-    return top, os.path.relpath(full, top)
+        if (full + "/").startswith("/tmp/"):
+            return ""
+        return "writes outside a git checkout are refused (except /tmp)"
+    if is_protected(os.path.relpath(full, top), env.protected(top)):
+        return f"{path} is part of the loop's own rules; the tower and workers never change it"
+    return ""
 
 
-def _protected_path(path, cwd, env):
-    top, rel = _rel_in_repo(path, cwd, env)
-    return bool(top) and is_protected(rel, env.protected(top))
+def _read_refused(path, cwd, env):
+    full = _full(path, cwd, env)
+    if SECRET_PATH.search(full) or SECRET_PATH.search(path):
+        return "reading or searching secret or credential files is blocked"
+    home = os.path.expanduser("~").rstrip("/")
+    if (full + "/").startswith(home + "/"):
+        inside_project = env.project_dir and (full + "/").startswith(os.path.realpath(env.project_dir) + "/")
+        if not inside_project and not env.toplevel(full):
+            return "reading in the home folder outside a git checkout is blocked"
+    return ""
 
 
 # ---------------------------------------------------------------------------------------------- shell
 def _segments(cmd):
     """Split a shell command into simple commands, respecting quotes. None if it can't be parsed."""
-    lexer = shlex.shlex(cmd.replace("\n", " ; ").replace("`", " ; "), posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
         toks = list(lexer)
@@ -199,68 +234,66 @@ def _split_redirects(toks):
     args, targets, i = [], [], 0
     while i < len(toks):
         tok = toks[i]
-        if tok in REDIRECTS or re.fullmatch(r"[0-9]+", tok) and i + 1 < len(toks) and toks[i + 1] in REDIRECTS:
-            if tok not in REDIRECTS:          # "2" in "2 > file": skip the fd number
-                i += 1
-                continue
+        if tok in REDIRECTS:
             if i + 1 < len(toks):
                 targets.append(toks[i + 1])
             i += 2
+            continue
+        if re.fullmatch(r"[0-9]+", tok) and i + 1 < len(toks) and toks[i + 1] in REDIRECTS:
+            i += 1
             continue
         args.append(tok)
         i += 1
     return args, targets
 
 
-def _writes_protected(args, targets, cwd, env):
-    if any(_protected_path(t, cwd, env) for t in targets if t != "/dev/null" and not t.startswith("&")):
-        return True
-    head, rest = os.path.basename(args[0]), args[1:]
-    plain = [a for a in rest if not a.startswith("-")]
-    if head == "dd":
-        plain = [a.split("=", 1)[1] for a in rest if a.startswith("of=")]
-    if head in WRITERS and any(_protected_path(a, cwd, env) for a in plain):
-        return True
-    if head in ("tar", "unzip", "cpio") and any(a.startswith("-C") or a == "-d" for a in rest):
-        return any(_protected_path(a, cwd, env) for a in plain)
-    if head in ("sed", "perl", "ruby") and any(a.startswith("-i") for a in rest):
-        return any(_protected_path(a, cwd, env) for a in plain)
-    return False
-
-
 def _git_cmd(args, cwd, env):
     where, i = cwd, 0
-    while i < len(args) and args[i].startswith("-"):
-        if args[i] == "-C" and i + 1 < len(args):
-            where = os.path.normpath(os.path.join(cwd or ".", args[i + 1]))
-            i += 2
-            continue
-        return block(f"git option '{args[i]}' before the command is blocked (only -C is allowed)")
+    if args[:1] == ["-C"]:
+        if len(args) < 2:
+            return block("git -C needs a folder")
+        where, i = os.path.normpath(os.path.join(cwd or ".", args[1])), 2
+    if i < len(args) and args[i].startswith("-"):
+        return block(f"git option '{args[i]}' before the command is blocked (only one -C is allowed)")
     if i >= len(args):
         return True, "git"
     sub, rest = args[i], args[i + 1:]
-    if sub in GIT_BLOCKED:
-        return block(f"git {sub} is blocked")
-    if sub == "reset" and any(a in ("--hard", "--merge", "--keep") for a in rest):
-        return block("git reset --hard is blocked")
-    if sub in ("fetch", "pull", "ls-remote"):
-        positional = [a for a in rest if not a.startswith("-")]
-        if any("://" in a or a.startswith("git@") or a.startswith("/") for a in rest) or (
-                positional and positional[0] != "origin"):
-            return block(f"git {sub} works only with origin")
+    if sub not in GIT_SUBCOMMANDS:
+        return block(f"git {sub} isn't on the tower's list")
+    plain = [a for a in rest if not a.startswith("-")]
+    if sub in ("fetch", "ls-remote"):
+        if any(a not in ("origin", "--heads", "--prune", "-q", "--quiet") for a in rest):
+            return block(f"git {sub} is allowed only as: git {sub} [--prune|--heads] origin")
         return True, "git"
     if sub == "push":
         return _push(rest, where, env)
+    if sub == "branch":
+        for name in plain:
+            shadowing = name.lower().startswith(("origin/", "refs/", "remotes/", "heads/"))
+            if shadowing or ("/" in name and not ROW_BRANCH.match(name)):
+                return block("git branch may only name row branches (a branch called origin/... would shadow main)")
+    if sub in ("switch", "checkout"):
+        if any(a.lower().startswith(("refs/", "remotes/")) for a in plain):
+            return block(f"git {sub}: use origin/<branch> or a row branch, not a raw ref")
+        for flag in ("-c", "-C", "-b", "-B", "--orphan"):
+            if flag in rest:
+                pos = rest.index(flag)
+                if pos + 1 >= len(rest) or not ROW_BRANCH.match(rest[pos + 1]):
+                    return block(f"git {sub} may create only row branches (tower/<id>)")
+    if sub == "worktree" and plain[:1] == ["add"]:
+        target = plain[1] if len(plain) > 1 else ""
+        if not target or not (_full(target, where, env) + "/").startswith("/tmp/"):
+            return block("git worktree add: put the worktree under /tmp/ct-<row>")
     paths = []
     if sub == "checkout":
         paths = rest[rest.index("--") + 1:] if "--" in rest else [
-            a for a in rest if not a.startswith("-") and os.path.exists(os.path.join(where or ".", a))]
+            a for a in plain if os.path.exists(os.path.join(where or ".", a))]
     elif sub in ("restore", "rm", "mv"):
-        paths = [a for a in rest if not a.startswith("-")]
-    elif sub == "worktree" and rest[:1] == ["add"]:
-        paths = [a for a in rest[1:] if not a.startswith("-")][:1]
-    if any(_protected_path(p, where, env) for p in paths):
-        return block(f"git {sub} on the loop's own rules is blocked")
+        paths = plain
+    for p in paths:
+        why = _write_refused(p, where, env)
+        if why:
+            return block(f"git {sub}: {why}")
     return True, "git"
 
 
@@ -268,20 +301,16 @@ def _push(rest, where, env):
     toks = list(rest)
     if toks and toks[0] in ("-u", "--set-upstream"):
         toks = toks[1:]
-    if len(toks) != 2 or toks[0] != "origin":
-        return block("git push is allowed only as: git push [-u] origin <row branch>, or "
-                     "git push origin HEAD:<row branch>")
-    ref = toks[1]
-    if ref.startswith("HEAD:"):
-        src, dst = "HEAD", ref[len("HEAD:"):]
-    elif ":" in ref:
-        return block("git push <src>:<dst> is allowed only as HEAD:<row branch>")
-    else:
-        src, dst = ref, ref
+    if len(toks) != 2 or toks[0] != "origin" or not toks[1].startswith("HEAD:"):
+        return block("git push is allowed only as: git push [-u] origin HEAD:refs/heads/<row branch>")
+    dst = toks[1][len("HEAD:"):]
     dst = dst[len("refs/heads/"):] if dst.startswith("refs/heads/") else dst
     if not ROW_BRANCH.match(dst):
         return block(f"pushing '{dst}' is blocked: only row branches (tower/<id>)")
-    changed = env.diff_names(where, src)
+    redirects = env.push_redirects(where)
+    if redirects is None or redirects:
+        return block("git config here could redirect a push (or couldn't be read); push blocked")
+    changed = env.diff_names(where, "HEAD")
     if changed is None:
         return block("couldn't compare this branch with origin/main, so the push is blocked")
     protected = env.protected(where)
@@ -315,6 +344,9 @@ def _gh_cmd(args, cwd, env):
             i += 2
         else:
             return block(f"gh api option '{flag}' isn't allowed (write it as separate words: -X POST, -f key=value)")
+    for flag, value in pairs:
+        if flag == "--jq" and re.search(r"\benv\b|\$ENV|\binput\b|\$__loc__|\binputs\b|\bdebug\b|\bstderr\b", value):
+            return block("that --jq filter isn't allowed")
     methods = [v.upper() for f, v in pairs if f == "-X"]
     fields = [(f, v) for f, v in pairs if f in ("-f", "-F")]
     if len(methods) > 1:
@@ -341,15 +373,15 @@ def _gh_cmd(args, cwd, env):
         if not ok:
             return block("a PR must be exactly: -X POST -f title=… -f head=<row branch> -f base=main -F draft=true "
                          "-F body=@runs/ct/<file>.md")
-        return _body_ok(values["body"][1], cwd, env)
+        return _body_ok(values["body"][1], cwd, env, comment=False)
     if re.fullmatch(r"/issues/[0-9]+/comments", route):
         if set(values) != {"body"} or values["body"][0] != "-F":
             return block("a comment must be exactly: -X POST -F body=@runs/ct/<file>.md")
-        return _body_ok(values["body"][1], cwd, env)
+        return _body_ok(values["body"][1], cwd, env, comment=True)
     return block(f"gh api POST {route} is blocked: reads, draft PRs and comments only")
 
 
-def _body_ok(value, cwd, env):
+def _body_ok(value, cwd, env, comment):
     path = value[1:] if value.startswith("@") else ""
     if not path or not BODY_FILE.match(path):
         return block("the body must be a file under runs/ct/, passed as -F body=@runs/ct/<file>.md")
@@ -358,57 +390,83 @@ def _body_ok(value, cwd, env):
         return block("couldn't read the body file")
     if any(p.search(text) for p in SECRETS):
         return block("the body contains secret-like text")
+    if comment and text.lstrip().splitlines()[:1] != [MARKER]:
+        return block(f"a tower comment must start with the line {MARKER}")
     return True, "gh api write"
 
 
 def _bash(cmd, cwd, env):
-    if RM_RF.search(cmd):
-        return block("rm -rf is blocked")
-    if SECRET_IN_CMD.search(cmd):
-        return block("commands that touch secret or credential files are blocked")
-    for pattern, what in RAW_BLOCK:
-        if pattern.search(cmd):
-            return block(f"{what} are blocked")
+    if re.search(r"[$`]", cmd):
+        return block("no $, variables, substitutions or backticks in tower commands; write values out literally")
+    if re.search(r"/dev/(tcp|udp)/", cmd):
+        return block("network paths are blocked")
     segments = _segments(cmd)
     if segments is None:
-        if re.search(r"\b(gh|git)\b", cmd):
-            return block("couldn't parse this command safely; run git and gh as simple commands")
-        return True, "bash"
+        return block("couldn't parse this command safely; use plain quoting")
+    if sum(len(s) for s in segments) > MAX_TOKENS:
+        return block("command too long; split it up")
+    here = cwd
     for toks in segments:
-        assignments = 0
-        while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
-            toks, assignments = toks[1:], assignments + 1
-        if not toks:
-            continue
+        if toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            return block("no variable assignments in tower commands")
         args, targets = _split_redirects(toks)
         if not args:
+            return block("a redirect needs a command")
+        head = args[0]
+        if re.search(r"[*?\[\]{}~\\]", head) or "/" in head:
+            return block(f"'{head}': run commands by their plain name")
+        if head not in SHELL_HEADS:
+            return block(f"'{head}' isn't on the tower's command list (use the Read, Grep, Glob, Edit and Write "
+                         "tools for files)")
+        for tok in args[1:] + targets:
+            if tok.startswith("~"):
+                return block("no ~ paths in tower commands")
+        if head not in ("git", "gh"):
+            plain_idx = [i for i, a in enumerate(args) if i > 0 and not a.startswith("-")]
+            grep_pattern = plain_idx[0] if head == "grep" and plain_idx else None   # grep's regex may use [ * ?
+            for i, tok in enumerate(args[1:], start=1):
+                if i != grep_pattern and re.search(r"[*?\[]", tok):
+                    return block("no glob patterns in tower commands (use the Glob tool)")
+            if any(re.search(r"[*?\[]", t) for t in targets):
+                return block("no glob patterns in tower commands (use the Glob tool)")
+        for target in targets:
+            if target in ("/dev/null",) or target.startswith("&"):
+                continue
+            why = _write_refused(target, here, env)
+            if why:
+                return block(why)
+        if head == "cd":
+            here = _full(args[1], here, env) if len(args) > 1 else here
             continue
-        head = os.path.basename(args[0])
-        names = [os.path.basename(t) for t in args]
-        if head in WEB_HEADS:
-            return block(f"{head} is blocked: no web access from a Code Tower repo")
-        if head in WRAPPERS:
-            return block(f"'{head}' is blocked: run commands directly")
-        if head in ("set", "export", "declare", "typeset") and (len(args) == 1 or args[1] in ("-p", "-x")):
-            return block("printing the environment is blocked")
-        if ("git" in names[1:] or "gh" in names[1:]) and head not in ("git", "gh"):
-            return block("git and gh must be the first word of a command")
-        if head in ("git", "gh"):
-            if assignments:
-                return block("no variable assignments in front of git or gh")
-            if any("$" in t for t in args):
-                return block("no variables or substitutions inside git or gh commands")
-            ok, why = (_git_cmd if head == "git" else _gh_cmd)(args[1:], cwd, env)
-            if not ok:
-                return ok, why
-        if head in ("python", "python3") or re.fullmatch(r"python3(\.[0-9]+)?", head):
-            if not any(p.match(" ".join([head] + args[1:])) for p in PY_SHAPES):
+        if head == "mkdir":
+            for a in args[1:]:
+                if not a.startswith("-"):
+                    why = _write_refused(a, here, env)
+                    if why:
+                        return block(why)
+        if head == "sort" and any(a.startswith("-o") or a == "--output" or a.startswith("--output=") for a in args):
+            return block("sort -o is blocked")
+        if head in READERS:
+            for a in args[1:]:
+                if not a.startswith("-"):
+                    why = _read_refused(a, here, env)
+                    if why:
+                        return block(why)
+        if head in ("python", "python3"):
+            if args[1:3] == ["-I", "-m"] and args[3:4] == ["pytest"]:
+                if not all(PYTEST_ARG.match(a) for a in args[4:]):
+                    return block("pytest runs only with -q, -x, -v, --tb=… and paths under tests/")
+            elif not any(p.match(" ".join(["python3"] + args[1:])) for p in PY_SHAPES):
                 return block("python runs only as: python3 -I -m pytest …, python3 -I checks/<x>.py, "
                              "python3 -I tower/<x>.py, or python3 -m pip install --quiet pytest")
-        if head in ("pip", "pip3"):
-            return block("pip is blocked (use: python3 -m pip install --quiet pytest)")
-        if _writes_protected(args, targets, cwd, env):
-            return block("shell writes to the loop's own rules are blocked")
+        if head == "git":
+            ok, why = _git_cmd(args[1:], here, env)
+            if not ok:
+                return ok, why
+        if head == "gh":
+            ok, why = _gh_cmd(args[1:], here, env)
+            if not ok:
+                return ok, why
     return True, "bash"
 
 
@@ -423,27 +481,18 @@ def _mcp(tool, inp):
             return True, "Notion read"
         if bare == "create-pages":
             parent = inp.get("parent")
-            ok = (isinstance(parent, dict) and set(parent) == {"data_source_id"}
-                  and str(parent["data_source_id"]).replace("collection://", "") == COORD_DS)
+            ok = (isinstance(parent, dict) and set(parent) <= {"type", "data_source_id"}
+                  and parent.get("type", "data_source_id") == "data_source_id"
+                  and str(parent.get("data_source_id", "")).replace("collection://", "") == COORD_DS)
             if not ok:
                 return block("Notion pages may be created only in the Coordination Entries data source")
+            if not isinstance(inp.get("pages"), list) or len(inp["pages"]) != 1:
+                return block("one Coordination Entry per call")
             if any(p.search(json.dumps(inp, default=str)) for p in SECRETS):
                 return block("the Coordination Entry contains secret-like text")
             return True, "Coordination Entry"
         return block(f"Notion '{name}' is blocked: the tower only reads and writes one Coordination Entry")
     return block(f"'{tool}' is blocked: the tower reads Notion and writes one Coordination Entry; no other apps")
-
-
-def _outside_repo_home(path, env):
-    """True for a path in the home folder that isn't inside the project or any git checkout (a worker's
-    worktree may live outside the project folder). Credential files are blocked by name separately."""
-    home = os.path.expanduser("~")
-    full = os.path.normpath(path if os.path.isabs(path) else os.path.join(env.project_dir or ".", path))
-    if not (full + "/").startswith(home.rstrip("/") + "/"):
-        return False
-    if env.project_dir and (full + "/").startswith(os.path.normpath(env.project_dir) + "/"):
-        return False
-    return not env.toplevel(full)
 
 
 def decide(tool, inp, cwd, env=None):
@@ -452,28 +501,29 @@ def decide(tool, inp, cwd, env=None):
     inp = inp or {}
     if tool.startswith("mcp__"):
         return _mcp(tool, inp)
-    if tool in ("WebFetch", "WebSearch"):
-        return block("no web access from a Code Tower repo")
-    if tool in ("Read", "Grep", "Glob", "LS", "NotebookRead"):
-        keys = ("file_path", "path", "notebook_path") + (("pattern",) if tool == "Glob" else ()) + ("glob",)
-        for key in keys:
+    if tool not in BUILTIN_TOOLS:
+        return block(f"'{tool}' isn't on the tower's tool list (no web, no other apps)")
+    if tool in ("Read", "Grep", "Glob", "LS"):
+        for key in ("file_path", "path", "notebook_path"):
             value = str(inp.get(key) or "")
-            if value and (SECRET_PATH.search(value) or SECRET_IN_CMD.search(value)):
+            if value:
+                why = _read_refused(value, cwd, env)
+                if why:
+                    return block(why)
+        # Glob's "pattern" and Grep's "glob" are file patterns; Grep's "pattern" is a text regex, so it isn't checked.
+        patterns = [str(inp.get("glob") or "")] + ([str(inp.get("pattern") or "")] if tool == "Glob" else [])
+        for value in (v for v in patterns if v):
+            if (SECRET_PATH.search(value) or re.search(r"(^|/)\.(env|ssh|aws|config/gh|claude\.json)", value)
+                    or value.startswith(("~", "/proc", "/sys"))):
                 return block("reading or searching secret or credential files is blocked")
-            if value and key != "pattern" and _outside_repo_home(value, env):
-                return block("reading outside the repo in the home folder is blocked")
         return True, "read"
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         path = str(inp.get("file_path") or inp.get("notebook_path") or "")
-        if SECRET_PATH.search(path):
-            return block("writing secret or credential files is blocked")
-        if _protected_path(path, cwd, env):
-            return block(f"{path} is part of the loop's own rules; the tower and workers never change it "
-                         "(rules change only through a PR Adam merges)")
-        return True, "file"
+        why = _write_refused(path, cwd, env) if path else "no path"
+        return (False, why) if why else (True, "file")
     if tool == "Bash":
         return _bash(str(inp.get("command", "")), cwd, env)
-    return True, "not fenced"
+    return True, "built-in tool"
 
 
 def main():

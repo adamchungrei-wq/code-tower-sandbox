@@ -1,12 +1,14 @@
 """SELECT: pick the rows the tower works this round. Code decides; the AI that will do the work never picks it.
 
-Usage: python3 -I tower/select_rows.py CHECKS_JSON HEADS_TXT [--prs PRS_JSON] [--now ISO8601]
-                                       [--returns RETURNS_JSON] [--rules rules/project.json]
+Usage: python3 -I tower/select_rows.py CHECKS_JSON HEADS_TXT [--prs PRS_JSON] [--returns RETURNS_JSON]
+                                       [--rules rules/project.json]
   CHECKS_JSON   output of checks/run_checks.py
   HEADS_TXT     output of: git ls-remote --heads origin
   PRS_JSON      output of: gh api repos/<repo>/pulls -X GET -f state=all -f per_page=100  (counts tonight's PRs)
   RETURNS_JSON  [{"id", "title", "pr", "branch"}]: open row PRs where Adam asked for changes. Code checks each one
                 (the branch must be that row's branch and the PR must be open) and takes the done test from PLAN.md.
+Row branches with no open PR (an earlier run stopped after its push) come back as mode "recover" rows; like new
+rows they open a PR, so they count against the nightly cap. The clock is the machine's, never an argument.
 Prints {"selected": [...], "skipped": [...], "counts": {...}}. Exit 0 ok · 1 bad input.
 """
 import json
@@ -21,15 +23,20 @@ ROW_BRANCH = re.compile(r"^(tower/|claude/tower-)([a-z0-9]+)$")
 UNDO = "Close the draft PR and delete the branch."
 
 
-def claimed_ids(heads_text):
-    """Row IDs that already have a row branch on the remote (their claim)."""
-    ids = set()
+def claimed_branches(heads_text):
+    """{row ID: [row branches on the remote]} — a row branch is its row's claim."""
+    out = {}
     for line in heads_text.splitlines():
         ref = line.strip().split("\t")[-1].replace("refs/heads/", "")
         match = ROW_BRANCH.match(ref)
         if match:
-            ids.add(match.group(2).upper())
-    return ids
+            out.setdefault(match.group(2).upper(), []).append(ref)
+    return out
+
+
+def claimed_ids(heads_text):
+    """Row IDs that already have a row branch on the remote (their claim)."""
+    return set(claimed_branches(heads_text))
 
 
 def prs_tonight(prs, now):
@@ -62,8 +69,9 @@ def branch_for(row_id, rules):
     return f"{rules.get('row_branch_prefix', 'tower/')}{row_id.lower()}"
 
 
-def select(report, claimed, rules, returns=(), prs=(), now=None):
-    """Pure function: run_checks report, claimed IDs, rules, return rows, the PR list, and the time now."""
+def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branches=None):
+    """Pure function: run_checks report, claimed IDs, rules, return rows, the PR list, the time now, and the
+    claimed branch names (for recovery)."""
     now = now or datetime.now(timezone.utc)
     plan_checks = {c["id"]: c for c in report["plan_checks"]}
     passing = {r["id"] for r in report["checks"] if r["pass"]}
@@ -76,6 +84,7 @@ def select(report, claimed, rules, returns=(), prs=(), now=None):
             waiting_on[dep] = waiting_on.get(dep, 0) + 1
     values = rules["values"]
     open_prs = open_row_prs(prs)
+    any_pr = {((pr.get("head") or {}).get("ref")) for pr in prs}          # any state: open, closed or merged
     rows, skipped = [], []
 
     for ret in returns:
@@ -83,7 +92,8 @@ def select(report, claimed, rules, returns=(), prs=(), now=None):
         check = plan_checks.get(rid)
         branch = str(ret.get("branch", ""))
         match = ROW_BRANCH.match(branch)
-        if not check or not match or match.group(2).upper() != rid or open_prs.get(branch) != ret.get("pr"):
+        if (not check or not match or match.group(2).upper() != rid or ret.get("pr") is None
+                or open_prs.get(branch) != ret.get("pr")):
             skipped.append({"id": rid or "?", "why": "return row rejected: not an open row PR on that row's branch"})
             continue
         rows.append({"id": rid, "title": str(ret.get("title") or check["what"]), "source": "return",
@@ -100,7 +110,19 @@ def select(report, claimed, rules, returns=(), prs=(), now=None):
         if check["id"] in return_ids:
             continue
         if check["id"].upper() in claimed:
-            skipped.append({"id": check["id"], "why": "claimed: its row branch already exists"})
+            branches = (claimed_branches or {}).get(check["id"].upper(), [])
+            if any(b in open_prs for b in branches):
+                skipped.append({"id": check["id"], "why": "claimed: its row branch has an open PR"})
+            elif any(b in any_pr for b in branches):
+                skipped.append({"id": check["id"], "why": "its PR was closed (Adam's call); delete the branch to "
+                                                          "let the row run again"})
+            elif branches:
+                rows.append({"id": check["id"], "title": check["what"], "source": "exit_gap",
+                             "value": values["exit_gap"], "risk": 0, "tier": "T1", "done_test": check["command"],
+                             "verifier": check.get("verifier", "machine"), "depends_on": [], "branch": branches[0],
+                             "pr": None, "mode": "recover", "undo": UNDO})
+            else:
+                skipped.append({"id": check["id"], "why": "claimed: its row branch already exists"})
             continue
         open_deps = [d for d in check.get("depends_on", []) if d not in passing]
         if open_deps:
@@ -118,13 +140,15 @@ def select(report, claimed, rules, returns=(), prs=(), now=None):
             ready.append(row)
         else:
             skipped.append({"id": row["id"], "why": "not AI-ready (value, risk or done test)"})
-    ready.sort(key=lambda r: (r["verifier"] != "machine", SOURCE_RANK[r["source"]], -r["value"], r["id"]))
+    mode_rank = {"fix": 0, "recover": 1, "fresh": 2}
+    ready.sort(key=lambda r: (mode_rank[r["mode"]], r["verifier"] != "machine", SOURCE_RANK[r["source"]],
+                              -r["value"], r["id"]))
 
     caps = rules["caps"]
     done = prs_tonight(prs, now)
     room = max(0, min(caps["workers_per_round"], caps["draft_prs_per_night"] - done))
     fix_rows = [r for r in ready if r["mode"] == "fix"]            # fixes don't open new PRs
-    new_rows = [r for r in ready if r["mode"] == "fresh"]
+    new_rows = [r for r in ready if r["mode"] in ("recover", "fresh")]   # these do: they share the nightly room
     selected = fix_rows[:caps["workers_per_round"]]
     selected += new_rows[:max(0, min(room, caps["workers_per_round"] - len(selected)))]
     skipped += [{"id": r["id"], "why": "over this round's cap"} for r in ready if r not in selected]
@@ -137,7 +161,7 @@ def select(report, claimed, rules, returns=(), prs=(), now=None):
 def main(argv):
     try:
         args, opts = list(argv), {}
-        for flag in ("--returns", "--prs", "--now", "--rules"):
+        for flag in ("--returns", "--prs", "--rules"):
             if flag in args:
                 i = args.index(flag)
                 opts[flag] = args[i + 1]
@@ -148,11 +172,10 @@ def main(argv):
         rules = json.loads(Path(opts.get("--rules", ROOT / "rules" / "project.json")).read_text(encoding="utf-8"))
         returns = json.loads(Path(opts["--returns"]).read_text(encoding="utf-8")) if "--returns" in opts else []
         prs = json.loads(Path(opts["--prs"]).read_text(encoding="utf-8")) if "--prs" in opts else []
-        now = datetime.fromisoformat(opts["--now"].replace("Z", "+00:00")) if "--now" in opts else None
     except (OSError, ValueError, KeyError, IndexError) as exc:
         print(json.dumps({"error": f"bad input: {exc}"}))
         return 1
-    print(json.dumps(select(report, claimed_ids(heads), rules, returns, prs, now), indent=2))
+    print(json.dumps(select(report, claimed_ids(heads), rules, returns, prs, None, claimed_branches(heads)), indent=2))
     return 0
 
 

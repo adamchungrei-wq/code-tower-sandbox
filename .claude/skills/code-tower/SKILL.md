@@ -17,13 +17,19 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
   - reads: `gh api repos/<github_repo>/<route> [--jq '…'] [-X GET -f state=all -f per_page=100]`
   - a draft PR: `gh api repos/<github_repo>/pulls -X POST -f title='…' -f head=<row branch> -f base=main -F draft=true -F body=@runs/ct/<id>-body.md --jq '{number, html_url}'`
   - a comment: `gh api repos/<github_repo>/issues/<n>/comments -X POST -F body=@runs/ct/<file>.md`
-- **Every comment the tower posts starts with `<!-- code-tower -->`.** SUPPLY ignores comments that carry it.
+- **Every comment the tower posts starts with `<!-- code-tower -->`** (the guard refuses a comment without it). SUPPLY ignores comments that carry it.
+- **The fence allows only exact command forms.** Type each command as its own call, in plain words:
+  - no `$`, variables, `$(…)`, backticks, `~` or globs;
+  - no `&&` chains around git or gh;
+  - edit files with the Edit and Write tools.
+  Pushes are only `git push [-u] origin HEAD:refs/heads/<row branch>`; workers do them, the tower never pushes.
 
 ## Start of every round
 1. `date -u`. `git fetch origin`, then `git switch --detach origin/main`. *Why: the round starts from the newest rules and code, even if Adam changed them on GitHub.*
 2. Read `CLAUDE.md`, `PLAN.md` and `rules/project.json`. If `"mode": "off"`, stop and say so. Policy version = `git rev-parse --short origin/main`. Quote it in every row and in the entry.
 3. `mkdir -p runs/ct`. `git ls-remote --heads origin > runs/ct/heads.txt`. `gh api repos/<github_repo>/pulls -X GET -f state=all -f per_page=100 > runs/ct/prs.json`.
-4. **Recovery.** A row branch with no open PR means an earlier run stopped part-way. Never start that row fresh. Send one worker in fix mode to finish it: re-run the done test, then open its draft PR. It then goes through CHECK like any other row. If its done test fails, add an ask: "finish or delete <branch>?". *Why: a restarted run never pushes or opens a PR twice, and nothing stays stuck as "claimed".*
+4. `git status --porcelain`. If it lists any file of the loop's own rules (see Guardrails), stop: the checkout was changed outside a PR. Report it as an ask.
+5. **Recovery is code's job.** A row branch that never had a PR means an earlier run stopped after its push. SELECT returns it as a `recover` row, and a worker in recover mode finishes it: it re-runs the done test, then opens the draft PR. A branch whose PR Adam closed is left alone until he deletes it. *Why: a restarted run never pushes or opens a PR twice, and nothing stays stuck as "claimed".*
 
 ## 1. SENSE (code)
 `python3 -I checks/run_checks.py > runs/ct/checks.json`, then route:
@@ -39,7 +45,7 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
 Free-form ideas: at most `free_form_proposals_per_run`, written in the entry as proposals, never worked. *Why: the loop works only from rules a person approved. It can propose new rules; it never adopts them.*
 
 ## 3. SELECT (code)
-`python3 -I tower/select_rows.py runs/ct/checks.json runs/ct/heads.txt --prs runs/ct/prs.json --now <date -u ISO> [--returns runs/ct/returns.json] > runs/ct/select.json`
+`python3 -I tower/select_rows.py runs/ct/checks.json runs/ct/heads.txt --prs runs/ct/prs.json --returns runs/ct/returns.json > runs/ct/select.json` (leave out `--returns` when there are none; the script uses the machine's clock)
 
 Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work and counts tonight's PRs; the AI that will do the work never picks it or sets its own cap.*
 
@@ -47,7 +53,7 @@ Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work
 - **Pre-flight first:** `gh api repos/<github_repo> --jq .full_name`, and a Notion fetch of the Coordination Entries data source (`rules/project.json` → coordination). If either fails, stop the round with that reason; start no worker.
 - **Rung 0:** no workers. Log each selected row as "would work" and go to CLOSE. **Rung 1:** continue.
 - Start every selected row in ONE message: one Agent call per row, `subagent_type: worker`, `isolation: worktree`. The brief is one paragraph:
-  `Job <project>-<yyyymmdd>-<row id>. Mode <fresh|fix>. Row <id>: <title>. Source <source>, value <v>. Branch <branch>[, PR #<n>]. Done test: <command> must pass, and python3 -I -m pytest -q must pass. Code under src/, tests under tests/; README.md only for documentation rows. Repo <github_repo>. Policy <sha>. Boundaries unchanged: draft PR only; no merge, no ready, no push except the row branch; no edits to the loop's rules; no secrets; no web; stop and report if access is missing.` For a fix row, add the checker's problems or Adam's comment.
+  `Job <project>-<yyyymmdd>-<row id>. Mode <fresh|fix|recover>. Row <id>: <title>. Source <source>, value <v>. Branch <branch>[, PR #<n>]. Done test: <command> must pass, and python3 -I -m pytest -q must pass. Code under src/, tests under tests/; README.md only for documentation rows. Repo <github_repo>. Policy <sha>. Boundaries unchanged: draft PR only; no merge, no ready, no push except the row branch; no edits to the loop's rules; no secrets; no web; stop and report if access is missing.` For a fix row, add the checker's problems or Adam's comment.
 - A worker that stops early gets one `SendMessage`: `Continue <Job> from where you stopped; same boundaries.` A second stop parks the row.
 - **A push refused by the session's proxy** (an HTTP 403 on `git push`, or "not permitted through this proxy") means this session can't push row branches. Stop every worker. Report the exact error. Add one ask: "switch row_branch_prefix to claude/tower- (a rules PR), or run the tower as a desktop session?"
 
@@ -61,9 +67,8 @@ For each worker result:
    - the branch name
    - `git diff origin/main...origin/<branch>`
    - the PR summary
-   - the output path `runs/ct/<id>-check.json`
-
-   Never give it the worker's reasoning.
+ 
+   Never give it the worker's reasoning. Its final message is the verdict JSON: save it with the Write tool to `runs/ct/<id>-check.json`.
 3. **Pass** means every check-run concluded `success` AND the checker passed. Then write `runs/ct/<id>-note.md` (first line `<!-- code-tower -->`, then the checker's `review_note`) and post it as a comment.
 4. **Fail:** one fix round (a new worker in fix mode with the checker's problems), then a new checker. A second fail parks the row: post a comment starting with the marker, saying `Parked: <reason>`, and add an ask.
 
@@ -92,7 +97,7 @@ For each worker result:
 - **Re-arm:** run another round only if rows remain, `rounds_per_run` and `draft_prs_per_night` allow it, `run_minutes` hasn't passed, and no stop rule fired.
 - **Stop rules:**
   - 2 rows failed in a row
-  - a guard block you didn't expect
+  - a guard block the run couldn't correct on its next call (a corrected command form is fine)
   - a push refused by the proxy
   - the plan or rules changed during the run
   - plan usage is over `weekly_usage_stop_percent`, if the session can see it; if it can't, the caps are the budget
