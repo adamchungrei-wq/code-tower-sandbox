@@ -1,0 +1,31 @@
+{
+  "_note": "Rules for this repo's Code Tower, read by the tower and by tower/select_rows.py. Fields follow chat 06's spec V0.2 §10 vocabulary (values by source, AI-ready test, caps, ladder rung, policy version = main's commit). JSON, not YAML, so the scripts need no extra library. A tower/ PR can never change this file (guard + PR guard); changes come as a rules/ PR that Adam reads.",
+  "project": "CT-SANDBOX",
+  "mode": "on",
+  "rung": 1,
+  "_rung_note": "0 = observe: rows are proposed, no worker runs. 1 = draft: workers open draft PRs; a person approves every merge. 2 = not allowed until Adam rules on evidence (plan §7.3).",
+  "values": {"return": 3, "exit_gap": 3, "follow_up": 2, "free_form": 1},
+  "ai_ready": {"min_value": 2, "max_risk": 1, "needs_done_test": true},
+  "caps": {
+    "workers_per_round": 3,
+    "rounds_per_run": 2,
+    "draft_prs_per_night": 3,
+    "asks_per_run": 5,
+    "free_form_proposals_per_run": 3,
+    "pr_changed_lines": 200,
+    "consecutive_fail_stop": 2,
+    "run_minutes": 45,
+    "weekly_usage_stop_percent": 85
+  },
+  "tamper_paths": [".claude/", ".github/", "rules/", "checks/", "tower/", "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml"],
+  "worker_paths": ["src/", "tests/", "README.md"],
+  "switches": {"look_ahead": false, "prep_rows": false},
+  "requesters": ["adamchungrei-wq"],
+  "coordination": {
+    "data_source": "collection://eb8da925-cf1c-4689-af1d-830f77fc5e96",
+    "home": "Adam AI OS",
+    "handoff_target": "04",
+    "thread": "Code Tower sandbox",
+    "plan_page": "https://app.notion.com/p/411b255aedd4812b9809fc23492a2aee"
+  }
+}

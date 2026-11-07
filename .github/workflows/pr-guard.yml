@@ -1,0 +1,37 @@
+# Judges every PR with MAIN's copy of the rules. pull_request_target runs this file and the checkout from main,
+# so a PR can't edit the workflow or the script that judges it. The PR's code is fetched as data and never run.
+# No secrets are used; the token is read-only.
+name: PR guard
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  pr-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch the PR head as data
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "pull/$PR/head:pr-head"
+      - name: Collect files, diff and summary
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          git diff --name-only "$BASE"...pr-head > "$RUNNER_TEMP/files.txt"
+          git diff "$BASE"...pr-head > "$RUNNER_TEMP/diff.txt"
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/body.txt"
+      - name: Check (secrets · loop rules untouched · worker paths · size · PR summary)
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: >-
+          python3 -I .github/scripts/pr_check.py --branch "$HEAD_REF"
+          --files "$RUNNER_TEMP/files.txt" --diff "$RUNNER_TEMP/diff.txt"
+          --body "$RUNNER_TEMP/body.txt" --rules rules/project.json

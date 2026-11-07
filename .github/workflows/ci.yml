@@ -1,0 +1,22 @@
+# Tests and the exit-check report, for every PR and every push to main.
+# The rules that judge a PR live in pr-guard.yml, which runs main's copy (a PR can't edit its own judge).
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --quiet pytest
+      - run: python -m pytest -q
+      - name: Exit-check report (information only; never fails the build)
+        run: python3 -I checks/run_checks.py
