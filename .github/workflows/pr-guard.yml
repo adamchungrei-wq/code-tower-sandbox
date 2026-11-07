@@ -1,10 +1,11 @@
-# Judges every PR with MAIN's copy of the rules. pull_request_target runs this file and the checkout from main,
-# so a PR can't edit the workflow or the script that judges it. The PR's code is fetched as data and never run.
-# No secrets are used; the token is read-only.
+# Judges every PR into main with MAIN's copy of the rules. pull_request_target runs this file and the checkout
+# from main, so a PR can't edit the workflow or the script that judges it. The PR's files, diff, summary and
+# labels are read as data; the PR's code is never run. No secrets are used; the token is read-only.
 name: PR guard
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 permissions:
   contents: read
   pull-requests: read
@@ -13,25 +14,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4   # main's copy; the read-only token stays for the fetch below (no PR code runs here)
         with:
           fetch-depth: 0
       - name: Fetch the PR head as data
         env:
           PR: ${{ github.event.pull_request.number }}
         run: git fetch --no-tags origin "pull/$PR/head:pr-head"
-      - name: Collect files, diff and summary
+      - name: Collect files, diff and summary (renames listed as delete + add)
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          git diff --name-only "$BASE"...pr-head > "$RUNNER_TEMP/files.txt"
-          git diff "$BASE"...pr-head > "$RUNNER_TEMP/diff.txt"
+          git diff --name-only --no-renames "$BASE"...pr-head > "$RUNNER_TEMP/files.txt"
+          git diff --no-renames "$BASE"...pr-head > "$RUNNER_TEMP/diff.txt"
           printf '%s' "$PR_BODY" > "$RUNNER_TEMP/body.txt"
-      - name: Check (secrets · loop rules untouched · worker paths · size · PR summary)
+      - name: Check (secrets · loop rules untouched unless Adam labelled it · worker paths · size · summary)
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: >-
           python3 -I .github/scripts/pr_check.py --branch "$HEAD_REF"
           --files "$RUNNER_TEMP/files.txt" --diff "$RUNNER_TEMP/diff.txt"
-          --body "$RUNNER_TEMP/body.txt" --rules rules/project.json
+          --body "$RUNNER_TEMP/body.txt" --rules rules/project.json --labels "$LABELS"

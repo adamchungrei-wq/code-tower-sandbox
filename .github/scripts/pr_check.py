@@ -1,7 +1,16 @@
 """PR checks. The pr-guard workflow runs main's copy of this file with main's rules/project.json, so a PR can't
-change the rules that judge it. It reads the PR's files, diff and body as data and never runs the PR's code.
+change the rules that judge it. It reads the PR's files, diff, summary and labels as data and never runs the
+PR's code.
+
+Rules:
+- Any PR that changes the loop's own rules (tamper paths) fails unless Adam has added the label
+  `rules-approved` by hand. The tower can't add labels (its fence allows reads, draft PRs and comments only).
+- Row PRs (tower/<id> or claude/tower-<id>) may change only worker paths and are capped in size.
+- No secret-like text in added lines or in the PR summary; no secret files.
+- The summary has the four sections and the approval line after Undo.
 
 Usage: python3 -I pr_check.py --branch REF --files FILES.txt --diff DIFF.txt --body BODY.txt --rules PROJECT.json
+                              [--labels "a,b"]
 Prints one problem per line. Exit 1 if any (the check fails) · 0 if none.
 """
 import argparse
@@ -11,8 +20,11 @@ import sys
 
 REQUIRED = ("## What changed", "## Risks", "## How to test", "## Undo")
 APPROVALS = ("Adam approves merge", "Adam approves production deploy")
-DEFAULT_TAMPER = (".claude/", ".github/", "rules/", "checks/", "tower/", "tests/fence/",
-                  "PLAN.md", "CLAUDE.md", "pyproject.toml")
+RULES_LABEL = "rules-approved"
+ROW_BRANCH = re.compile(r"^(tower/|claude/tower-)[a-z0-9]+$")
+DEFAULT_TAMPER = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/", ".claude/agents/",
+                  ".claude/skills/", ".claude/commands/", ".github/", ".gitignore", "rules/", "checks/", "tower/",
+                  "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml")
 SECRETS = (
     ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("AWS key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -37,7 +49,7 @@ def is_tamper(path, tamper):
     return False
 
 
-def problems(branch, files, diff, body, rules):
+def problems(branch, files, diff, body, rules, labels=()):
     """Pure function: every problem with this PR, as plain one-line strings."""
     out = []
     lines = diff.splitlines()
@@ -46,28 +58,32 @@ def problems(branch, files, diff, body, rules):
     for name, pattern in SECRETS:
         if any(pattern.search(l) for l in added):
             out.append(f"secret-like text in added lines ({name})")
+        if pattern.search(body):
+            out.append(f"secret-like text in the PR summary ({name})")
     for f in files:
         if SECRET_FILE.search(f):
             out.append(f"secret or credential file in the PR: {f}")
-    if branch.startswith("tower/"):
-        tamper = tuple(rules.get("tamper_paths", ())) + DEFAULT_TAMPER
-        touched = [f for f in files if is_tamper(f, tamper)]
+    tamper = tuple(rules.get("tamper_paths", ())) + DEFAULT_TAMPER
+    touched = [f for f in files if is_tamper(f, tamper)]
+    if touched and RULES_LABEL not in labels:
+        out.append("this PR changes the loop's own rules (" + ", ".join(touched) + "); it passes only after Adam "
+                   f"adds the '{RULES_LABEL}' label")
+    if ROW_BRANCH.match(branch):
         if touched:
-            out.append("a tower PR changes the loop's own rules: " + ", ".join(touched))
+            out.append("a row PR may never change the loop's own rules: " + ", ".join(touched))
         allowed = tuple(rules.get("worker_paths", ()))
         outside = [f for f in files if f not in touched
                    and not any(f == p.rstrip("/") or (p.endswith("/") and f.startswith(p)) for p in allowed)]
         if outside:
-            out.append("a tower PR changes files outside the worker paths: " + ", ".join(outside))
+            out.append("a row PR changes files outside the worker paths: " + ", ".join(outside))
         cap = int(rules.get("caps", {}).get("pr_changed_lines", 200))
         changed = len(added) + len(removed)
         if changed > cap:
-            out.append(f"{changed} changed lines; tower PRs are capped at {cap}")
+            out.append(f"{changed} changed lines; row PRs are capped at {cap}")
     for heading in REQUIRED:
         if heading not in body:
             out.append(f"the PR summary is missing '{heading}'")
-    # The approval line closes the summary: it must sit on its own line after the Undo section. A tool footer
-    # (e.g. "Generated with Claude Code") may follow it.
+    # The approval line closes the summary: on its own line after the Undo section. A tool footer may follow.
     after_undo = body.split("## Undo", 1)[1] if "## Undo" in body else ""
     if not any(l.strip() in APPROVALS for l in after_undo.splitlines()):
         out.append("the PR summary must close with 'Adam approves merge' on its own line after the Undo section")
@@ -78,6 +94,7 @@ def main(argv):
     ap = argparse.ArgumentParser()
     for flag in ("--branch", "--files", "--diff", "--body", "--rules"):
         ap.add_argument(flag, required=True)
+    ap.add_argument("--labels", default="")
     a = ap.parse_args(argv)
     try:
         files = [f.strip() for f in open(a.files, encoding="utf-8") if f.strip()]
@@ -87,7 +104,8 @@ def main(argv):
     except (OSError, ValueError) as exc:
         print(f"pr-guard: can't read inputs ({exc}); failing closed")
         return 1
-    found = problems(a.branch, files, diff, body, rules)
+    labels = [l.strip() for l in a.labels.split(",") if l.strip()]
+    found = problems(a.branch, files, diff, body, rules, labels)
     for p in found:
         print(p)
     if not found:

@@ -1,7 +1,9 @@
 {
-  "_note": "Rules for this repo's Code Tower, read by the tower and by tower/select_rows.py. Fields follow chat 06's spec V0.2 §10 vocabulary (values by source, AI-ready test, caps, ladder rung, policy version = main's commit). JSON, not YAML, so the scripts need no extra library. A tower/ PR can never change this file (guard + PR guard); changes come as a rules/ PR that Adam reads.",
+  "_note": "Rules for this repo's Code Tower, read by the tower, tower/select_rows.py and (from main's copy) the guard and the PR guard. Fields follow chat 06's spec V0.2 §10 vocabulary (values by source, AI-ready test, caps, ladder rung, policy version = main's commit). JSON, not YAML, so the scripts need no extra library. The tower and its workers can never change this file; a change comes as a PR made outside the tower that passes only after Adam adds the 'rules-approved' label and merges it.",
   "project": "CT-SANDBOX",
   "github_repo": "adamchungrei-wq/code-tower-sandbox",
+  "row_branch_prefix": "tower/",
+  "_row_branch_note": "If cloud sessions refuse pushes to tower/* (the proxy may allow only claude/* branches), change this to claude/tower- in a rules PR; the guard, CI and the PR guard accept both.",
   "mode": "on",
   "rung": 1,
   "_rung_note": "0 = observe: rows are proposed, no worker runs. 1 = draft: workers open draft PRs; a person approves every merge. 2 = not allowed until Adam rules on evidence (plan §7.3).",
@@ -18,7 +20,7 @@
     "run_minutes": 45,
     "weekly_usage_stop_percent": 85
   },
-  "tamper_paths": [".claude/", ".github/", "rules/", "checks/", "tower/", "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml"],
+  "tamper_paths": [".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/", ".claude/agents/", ".claude/skills/", ".claude/commands/", ".github/", ".gitignore", "rules/", "checks/", "tower/", "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml"],
   "worker_paths": ["src/", "tests/", "README.md"],
   "switches": {"look_ahead": false, "prep_rows": false},
   "requesters": ["adamchungrei-wq"],

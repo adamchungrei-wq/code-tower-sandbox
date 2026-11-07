@@ -13,7 +13,9 @@ def test_plan_block_is_valid_and_every_command_is_runnable():
     assert [c["id"] for c in data["checks"]] == ["E1", "E2", "E3", "E4"]
     assert all(run_checks.SAFE_COMMAND.match(c["command"]) for c in data["checks"])
     for check in data["checks"]:
-        assert (ROOT / check["command"].split()[-1]).is_file(), check["command"]
+        script = ROOT / check["command"].split()[-1]
+        assert script.is_file(), check["command"]
+        assert f'print("{check["id"]} pass")' in script.read_text(encoding="utf-8"), script
 
 
 def block(checks_json):
@@ -28,6 +30,8 @@ def test_rejects_bad_blocks():
     with pytest.raises(ValueError):
         run_checks.load_block(block('{"checks": [{"id": "A", "what": "a", "command": "c"},'
                                     ' {"id": "A", "what": "b", "command": "d"}]}'))
+    with pytest.raises(ValueError):
+        run_checks.load_block(block('{"checks": [{"id": "a-1", "what": "a", "command": "c"}]}'))
 
 
 def test_only_safe_commands_run(tmp_path):
@@ -35,13 +39,24 @@ def test_only_safe_commands_run(tmp_path):
     assert result["pass"] is False and result["error"] == "command not allowed"
 
 
-def test_pass_and_fail(tmp_path):
-    (tmp_path / "checks").mkdir()
-    (tmp_path / "checks" / "ok_check.py").write_text("print('ok')\n")
-    (tmp_path / "checks" / "bad_check.py").write_text("raise SystemExit(1)\n")
-    ok = run_checks.run_check({"id": "A", "what": "a", "command": "python3 -I checks/ok_check.py"}, root=tmp_path)
-    bad = run_checks.run_check({"id": "B", "what": "b", "command": "python3 -I checks/bad_check.py"}, root=tmp_path)
-    assert ok["pass"] is True and bad["pass"] is False
+def _check(tmp_path, name, body):
+    (tmp_path / "checks").mkdir(exist_ok=True)
+    (tmp_path / "checks" / f"{name}.py").write_text(body)
+    return {"id": "A", "what": "a", "command": f"python3 -I checks/{name}.py"}
+
+
+def test_pass_needs_exit_zero_and_the_pass_line(tmp_path):
+    assert run_checks.run_check(_check(tmp_path, "good", "print('A pass')\n"), root=tmp_path)["pass"] is True
+    assert run_checks.run_check(_check(tmp_path, "bad", "raise SystemExit(1)\n"), root=tmp_path)["pass"] is False
+    early = run_checks.run_check(_check(tmp_path, "early", "import os\nos._exit(0)\n"), root=tmp_path)
+    assert early["pass"] is False and "pass line" in early["error"]
+
+
+def test_only_one_check(tmp_path):
+    out = run_checks.report(PLAN, root=ROOT, only="E1")
+    assert out["total"] == 1 and out["checks"][0]["id"] == "E1"
+    with pytest.raises(ValueError):
+        run_checks.report(PLAN, root=ROOT, only="E9")
 
 
 def test_report_covers_every_check():

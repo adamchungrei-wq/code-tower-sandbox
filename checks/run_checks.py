@@ -1,8 +1,10 @@
 """SENSE: run the exit checks in PLAN.md's ```json exit-checks block and print one JSON report.
 
-Usage: python3 -I checks/run_checks.py [--plan PATH] [--strict]
-Exit 0 = report printed (even when checks fail) · 1 = the plan block is missing or invalid · 2 = --strict and a check failed.
-Only commands shaped "python3 -I checks/<name>.py" run, so editing the plan can't make the tower run anything else.
+Usage: python3 -I checks/run_checks.py [--plan PATH] [--only ID] [--strict]
+Exit 0 = report printed (even when checks fail) · 1 = the plan block is missing or invalid · 2 = --strict and a
+check failed.
+A check passes only when its script exits 0 AND its last line of output is "<ID> pass" (so a module that exits
+early can't fake a pass). Only commands shaped "python3 -I checks/<name>.py" run.
 """
 import json
 import re
@@ -30,6 +32,8 @@ def load_block(text):
         for key in ("id", "what", "command"):
             if not isinstance(check.get(key), str) or not check[key].strip():
                 raise ValueError(f"a check is missing '{key}': {check}")
+        if not re.fullmatch(r"[A-Z][A-Z0-9]*", check["id"]):
+            raise ValueError(f"check id {check['id']!r} must be capital letters and digits")
         if check["id"] in seen:
             raise ValueError(f"duplicate check id {check['id']}")
         seen.add(check["id"])
@@ -51,25 +55,33 @@ def run_check(check, root=ROOT, timeout=60):
                               text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"id": check["id"], "pass": False, "error": "timeout", "output": ""}
+    out_lines = proc.stdout.strip().splitlines()
+    said_pass = bool(out_lines) and out_lines[-1].strip() == f"{check['id']} pass"
     tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
-    return {"id": check["id"], "pass": proc.returncode == 0, "error": None, "output": "\n".join(tail)}
+    error = None if proc.returncode != 0 or said_pass else "exited 0 without printing its pass line"
+    return {"id": check["id"], "pass": proc.returncode == 0 and said_pass, "error": error, "output": "\n".join(tail)}
 
 
-def report(plan_text, root=ROOT):
+def report(plan_text, root=ROOT, only=None):
     data = load_block(plan_text)
-    results = [run_check(c, root) for c in data["checks"]]
+    checks = [c for c in data["checks"] if only is None or c["id"] == only]
+    if only is not None and not checks:
+        raise ValueError(f"no exit check with id {only}")
+    results = [run_check(c, root) for c in checks]
     passing = sum(1 for r in results if r["pass"])
     return {"phase": data.get("phase", ""), "passing": passing, "total": len(results),
             "checks": results, "plan_checks": data["checks"]}
 
 
 def main(argv):
-    plan = ROOT / "PLAN.md"
+    plan, only = ROOT / "PLAN.md", None
     if "--plan" in argv:
         plan = Path(argv[argv.index("--plan") + 1])
+    if "--only" in argv:
+        only = argv[argv.index("--only") + 1]
     try:
-        out = report(plan.read_text(encoding="utf-8"), root=plan.resolve().parent)
-    except (OSError, ValueError) as exc:
+        out = report(plan.read_text(encoding="utf-8"), root=plan.resolve().parent, only=only)
+    except (OSError, ValueError, IndexError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
     print(json.dumps(out, indent=2))

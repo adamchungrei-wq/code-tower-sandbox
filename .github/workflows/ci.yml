@@ -1,4 +1,4 @@
-# Tests and the exit-check report, for every PR and every push to main.
+# Tests and exit checks, for every PR and every push to main.
 # The rules that judge a PR live in pr-guard.yml, which runs main's copy (a PR can't edit its own judge).
 name: CI
 on:
@@ -13,10 +13,22 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python -m pip install --quiet pytest
-      - run: python -m pytest -q
-      - name: Exit-check report (information only; never fails the build)
+      - name: Tests (fails if none ran)
+        run: |
+          python -m pytest -q --junitxml="$RUNNER_TEMP/junit.xml"
+          python3 -I -c "import sys, xml.etree.ElementTree as E; r = E.parse(sys.argv[1]).getroot(); s = r if r.tag == 'testsuite' else r.find('testsuite'); n = int(s.get('tests', 0)); print(n, 'tests ran'); sys.exit(0 if n > 0 else 1)" "$RUNNER_TEMP/junit.xml"
+      - name: This row's exit check must pass (row branches only)
+        if: github.event_name == 'pull_request' && (startsWith(github.head_ref, 'tower/') || startsWith(github.head_ref, 'claude/tower-'))
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          ID=$(printf '%s' "$HEAD_REF" | sed -E 's#^(tower/|claude/tower-)##' | tr '[:lower:]' '[:upper:]')
+          python3 -I checks/run_checks.py --only "$ID" --strict
+      - name: Exit-check report (information only)
         run: python3 -I checks/run_checks.py
