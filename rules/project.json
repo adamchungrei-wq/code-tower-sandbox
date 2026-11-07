@@ -1,6 +1,7 @@
 {
   "_note": "Rules for this repo's Code Tower, read by the tower and by tower/select_rows.py. Fields follow chat 06's spec V0.2 §10 vocabulary (values by source, AI-ready test, caps, ladder rung, policy version = main's commit). JSON, not YAML, so the scripts need no extra library. A tower/ PR can never change this file (guard + PR guard); changes come as a rules/ PR that Adam reads.",
   "project": "CT-SANDBOX",
+  "github_repo": "adamchungrei-wq/code-tower-sandbox",
   "mode": "on",
   "rung": 1,
   "_rung_note": "0 = observe: rows are proposed, no worker runs. 1 = draft: workers open draft PRs; a person approves every merge. 2 = not allowed until Adam rules on evidence (plan §7.3).",

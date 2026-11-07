@@ -7,7 +7,9 @@ blocks. Hooks also run when a scheduled run auto-approves tools, so this is the 
 Blocks:
   - edits to the loop's own rules (TAMPER) from a tower/ branch, including plain shell writes;
   - pushes of anything but tower/* or rules/* branches; pushes to main; force, delete, --all, --mirror, --tags;
-  - gh, except: pr create --draft · pr view · pr list · pr diff · pr checks · pr comment · auth status;
+  - gh, except `gh auth status` and `gh api` REST calls on this repo that read, open a DRAFT PR, or comment
+    (Claude Code sessions block GitHub's GraphQL, so `gh pr ...` commands fail there anyway; merge, ready,
+    auto-merge, review, edit and delete routes are blocked);
   - secret files in paths or commands; rm -rf; git reset --hard; curl and wget; WebFetch and WebSearch;
   - MCP tools that aren't reads, except: Notion pages created in the Coordination Entries data source, and
     GitHub draft PRs and issue comments.
@@ -32,8 +34,9 @@ SECRET_IN_CMD = re.compile(r"(^|[\s/'\"=])(\.env\b|[\w.-]*\.pem\b|id_rsa|credent
                            re.I)
 RM_RF = re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-r\s+-f|-f\s+-r)\b")
 WEB_CMD = re.compile(r"(^|[\s;&|(])(curl|wget)\b")
-GH_OK = re.compile(r"^(pr\s+(view|list|diff|checks|comment)\b|auth\s+status\b|pr\s+create\b(?=.*\s--draft\b))")
-SEGMENT = re.compile(r"&&|\|\||;|\||\n")
+GH_REPO_PATH = re.compile(r"^/?repos/([^/]+)/([^/?#]+)(/[^?#]*)?(\?.*)?$")
+GH_VALUE_FLAGS = {"-H", "--header", "--jq", "-q", "--template", "-t", "--hostname", "--cache", "-p", "--preview"}
+GH_FIELD_FLAGS = {"-f", "-F", "--field", "--raw-field"}
 BAD_PUSH_FLAGS = ("--force", "-f", "--force-with-lease", "--delete", "-d", "--all", "--mirror", "--tags", "--prune")
 WRITERS = {"tee", "mv", "cp", "rm", "truncate", "chmod", "touch", "ln", "install"}
 
@@ -79,11 +82,87 @@ def toplevel_of(path):
     return _git(["rev-parse", "--show-toplevel"], path)
 
 
-def _tokens(segment):
+def repo_of(path):
+    """owner/name of this repo: rules/project.json "github_repo", else the origin remote's last two segments."""
+    top = toplevel_of(path)
+    if top:
+        try:
+            data = json.loads((Path(top) / "rules" / "project.json").read_text(encoding="utf-8"))
+            if data.get("github_repo"):
+                return str(data["github_repo"])
+        except (OSError, ValueError):
+            pass
+    match = re.search(r"([^/:]+)/([^/]+?)(\.git)?$", _git(["remote", "get-url", "origin"], path))
+    return f"{match.group(1)}/{match.group(2)}" if match else ""
+
+
+def _gh(args, repo):
+    """gh is allowed only as `gh auth status` or a REST `gh api` call on this repo that reads, opens a draft PR,
+    or comments on an issue or PR."""
+    if args[:2] == ["auth", "status"]:
+        return True, "gh auth status"
+    if not args or args[0] != "api":
+        return False, ("only `gh api` (REST) and `gh auth status` are allowed: other gh commands use GraphQL, which "
+                       "Claude Code sessions block, and some of them merge or approve")
+    method, explicit, path, fields, i, rest_args = "GET", False, None, [], 0, args[1:]
+    while i < len(rest_args):
+        arg = rest_args[i]
+        if arg in ("-X", "--method") and i + 1 < len(rest_args):
+            method, explicit, i = rest_args[i + 1].upper(), True, i + 2
+        elif arg.startswith("--method="):
+            method, explicit, i = arg.split("=", 1)[1].upper(), True, i + 1
+        elif arg in GH_FIELD_FLAGS and i + 1 < len(rest_args):
+            fields.append(rest_args[i + 1])
+            i += 2
+        elif arg == "--input":
+            return False, "gh api --input is blocked: pass fields with -f / -F"
+        elif arg in GH_VALUE_FLAGS and i + 1 < len(rest_args):
+            i += 2
+        elif arg.startswith("-"):
+            i += 1
+        else:
+            path = path if path is not None else arg
+            i += 1
+    if fields and not explicit:
+        method = "POST"          # gh api sends POST when fields are given
+    match = GH_REPO_PATH.match(path or "")
+    if not match:
+        return False, f"gh api '{path}' is blocked: only repos/<this repo>/... REST routes"
+    owner_repo, route = f"{match.group(1)}/{match.group(2)}", match.group(3) or ""
+    if not repo or owner_repo.lower() != repo.lower():
+        return False, f"gh api is limited to this repo ({repo or 'unknown'})"
+    if "/ccr/" in route or re.search(r"/merges?(/|$)", route):
+        return False, "merge, ready-for-review and auto-merge routes are blocked"
+    if method == "GET":
+        return True, "gh api read"
+    if method == "POST" and route == "/pulls":
+        if "draft=true" in fields:
+            return True, "draft PR"
+        return False, "PRs must be opened as drafts (-F draft=true)"
+    if method == "POST" and re.fullmatch(r"/issues/\d+/comments", route):
+        return True, "comment"
+    return False, f"gh api {method} {route or '/'} is blocked: reads, draft PRs and comments only"
+
+
+def _segments(cmd):
+    """Split a shell command into simple commands, respecting quotes. None if it can't be parsed."""
+    lexer = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        return shlex.split(segment)
+        toks = list(lexer)
     except ValueError:
-        return segment.split()
+        return None
+    segments, current = [], []
+    for tok in toks:
+        if tok and set(tok) <= set("|&;()"):
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+    return segments
 
 
 def _rel(arg, base):
@@ -144,27 +223,30 @@ def _git_command(toks, cwd, branch_of):
     return True, "push"
 
 
-def _bash(cmd, cwd, branch_of, toplevel_of):
+def _bash(cmd, cwd, branch_of, toplevel_of, repo_of):
     if RM_RF.search(cmd):
         return False, "rm -rf is blocked"
     if SECRET_IN_CMD.search(cmd):
         return False, "commands touching .env or credential files are blocked"
     if WEB_CMD.search(cmd):
         return False, "curl and wget are blocked: no web access from a Code Tower repo"
+    segments = _segments(cmd)
+    if segments is None:
+        if re.search(r"\b(gh|git)\b", cmd):
+            return False, "couldn't parse this command safely; run git and gh as simple commands"
+        return True, "bash"
     branch = branch_of(cwd) if cwd else ""
     base = toplevel_of(cwd) if cwd else ""
-    for segment in SEGMENT.split(cmd):
-        toks = _tokens(segment)
+    for toks in segments:
         while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
             toks = toks[1:]
         if not toks:
             continue
-        head = os.path.basename(toks[0])
+        head = os.path.basename(toks[0].lstrip("`'\"$"))
         if head == "gh":
-            rest = " ".join(toks[1:])
-            if not GH_OK.match(rest):
-                return False, (f"'gh {rest[:40]}' is blocked: only pr create --draft, pr view, pr list, pr diff, "
-                               "pr checks, pr comment and auth status")
+            ok, why = _gh(toks[1:], repo_of(cwd) if cwd else "")
+            if not ok:
+                return ok, why
         if head == "git":
             ok, why = _git_command(toks, cwd, branch_of)
             if not ok:
@@ -203,8 +285,8 @@ def _mcp(tool, inp):
     return False, f"'{name}' is blocked: no writes to live systems from a Code Tower repo"
 
 
-def decide(tool, inp, cwd, branch_of=branch_of, toplevel_of=toplevel_of):
-    """Return (allowed, reason). Pure apart from the two git lookups, which tests replace."""
+def decide(tool, inp, cwd, branch_of=branch_of, toplevel_of=toplevel_of, repo_of=repo_of):
+    """Return (allowed, reason). Pure apart from the git and repo lookups, which tests replace."""
     inp = inp or {}
     if tool.startswith("mcp__"):
         return _mcp(tool, inp)
@@ -226,7 +308,7 @@ def decide(tool, inp, cwd, branch_of=branch_of, toplevel_of=toplevel_of):
                                "(a rules/ PR, daytime, read by Adam)")
         return True, "file"
     if tool == "Bash":
-        return _bash(str(inp.get("command", "")), cwd, branch_of, toplevel_of)
+        return _bash(str(inp.get("command", "")), cwd, branch_of, toplevel_of, repo_of)
     return True, "not fenced"
 
 

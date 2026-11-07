@@ -13,7 +13,7 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
 ## Before anything
 1. `date -u`. Read `CLAUDE.md`, `PLAN.md` and `rules/project.json`. If `"mode": "off"`, stop and say so.
 2. `git fetch origin` and `git merge --ff-only origin/main`. Policy version = `git rev-parse --short origin/main`. Every row and the entry quote it. *Why: any row can be traced to the rules that allowed it.*
-3. `mkdir -p /tmp/ct`. **Recovery check:** `git ls-remote --heads origin 'tower/*'`, and if `gh` works, `gh pr list --state open --json number,headRefName,isDraft,title`. A `tower/` branch with no PR means an earlier run stopped part-way: list it on the board and leave it alone; never start the same row twice. *Why: a restarted run must never push or open a PR twice.*
+3. `mkdir -p /tmp/ct`. GitHub is REST only: `gh api repos/<github_repo>/...` with `<github_repo>` from `rules/project.json` (Claude Code sessions block GraphQL, so `gh pr ...` commands fail; the guard allows reads, draft PRs and comments). **Recovery check:** `git ls-remote --heads origin 'tower/*'` and `gh api 'repos/<github_repo>/pulls?state=open' --jq '[.[] | {number, branch: .head.ref, draft, title}]'`. A `tower/` branch with no PR means an earlier run stopped part-way: list it on the board and leave it alone; never start the same row twice. *Why: a restarted run must never push or open a PR twice.*
 
 ## 1. SENSE (code)
 `python3 -I checks/run_checks.py > /tmp/ct/checks.json`, then route:
@@ -23,7 +23,7 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
 
 ## 2. SUPPLY (rows come from written rules)
 In this order:
-1. **return:** a requester (`rules/project.json` → `requesters`) asked for changes on an open `tower/` PR since its last commit. Read it with `gh pr view <n> --comments`. Write each one to `/tmp/ct/returns.json` as `{"id", "title", "pr", "branch", "done_test"}`.
+1. **return:** a requester (`rules/project.json` → `requesters`) asked for changes on an open `tower/` PR since its last commit. Read `gh api repos/<github_repo>/issues/<n>/comments` and `gh api repos/<github_repo>/pulls/<n>/reviews`; keep only comments from `requesters` made after the PR's last commit. Write each one to `/tmp/ct/returns.json` as `{"id", "title", "pr", "branch", "done_test"}`.
 2. **exit_gap:** a failing exit check (SELECT builds these from the report).
 3. **follow_up:** a fixable problem a checker named in an earlier round. Today these go in the entry as proposals.
 
@@ -46,9 +46,9 @@ Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work
 
 ## 5. CHECK (code first, then a fresh checker)
 For each worker result:
-1. If `gh` works: `gh pr checks <n>` (CI tests and PR guard).
+1. CI and the PR guard: `gh api repos/<github_repo>/commits/<head sha>/check-runs --jq '[.check_runs[] | {name, status, conclusion}]'`. Not finished yet → check the others first and come back once.
 2. Start a NEW checker (`subagent_type: checker`) per row. Give it only: the row JSON from `/tmp/ct/select.json`, the branch name, `git diff origin/main...origin/<branch>`, the PR summary, and the output path `/tmp/ct/<row id>-check.json`. Never give it the worker's reasoning.
-3. **Pass:** post its `review_note` with `gh pr comment <n> --body-file <file>`. If `gh` can't, put the note in the entry.
+3. **Pass:** write its `review_note` to a file and post it: `gh api repos/<github_repo>/issues/<n>/comments -F body=@<file>`. If that fails, put the note in the entry.
 4. **Fail:** one fix round. A new worker works the same branch from the checker's `problems`; then a new checker. A second fail parks the row: comment `Parked: <reason>` and add an ask.
 
 *Why: nothing closes on the worker's word, and the checker never saw the work being made.*

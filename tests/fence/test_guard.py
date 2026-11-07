@@ -9,8 +9,12 @@ import guard
 ROOT = Path(__file__).resolve().parents[2]
 
 
+REPO = "adamchungrei-wq/code-tower-sandbox"
+
+
 def decide(tool, inp, branch="main", top="/repo"):
-    return guard.decide(tool, inp, "/repo", branch_of=lambda p: branch, toplevel_of=lambda p: top)[0]
+    return guard.decide(tool, inp, "/repo", branch_of=lambda p: branch, toplevel_of=lambda p: top,
+                        repo_of=lambda p: REPO)[0]
 
 
 def bash(cmd, branch="tower/e1"):
@@ -57,14 +61,40 @@ def test_dangerous_push_flags_blocked():
         assert not bash(cmd), cmd
 
 
-def test_gh_allow_list():
-    assert bash("gh pr create --draft --base main --head tower/e1 --title 'E1' --body-file /tmp/ct/b.md")
-    assert bash("gh pr view 3 --comments")
-    assert bash("gh pr list --state open --json number,headRefName")
-    assert bash("gh pr comment 3 --body-file /tmp/ct/note.md")
-    assert not bash("gh pr create --base main --title x --body y")      # not a draft
-    for cmd in ("gh pr merge 3", "gh pr ready 3", "gh pr review 3 --approve", "gh pr close 3", "gh api repos/x",
-                "gh repo edit", "gh auth token", "cd /repo && gh pr merge 3 --squash", "GH_TOKEN=x gh pr merge 1"):
+def test_gh_rest_allow_list():
+    allowed = (
+        f"gh api 'repos/{REPO}/pulls?state=open' --jq '[.[] | {{number, branch: .head.ref, draft}}]'",
+        f"gh api repos/{REPO}/pulls -X POST -f title='E1: slugify' -f head=tower/e1 -f base=main -F draft=true "
+        "-F body=@/tmp/ct/E1-body.md --jq '{number, html_url}'",
+        f"gh api repos/{REPO}/pulls -f title=x -f head=tower/e1 -f base=main -F draft=true",   # POST implied
+        f"gh api repos/{REPO}/issues/3/comments -F body=@/tmp/ct/note.md",
+        f"gh api repos/{REPO}/pulls/3/reviews",
+        f"gh api repos/{REPO}/commits/abc123/check-runs --jq '.check_runs[].conclusion'",
+        "gh auth status",
+    )
+    for cmd in allowed:
+        assert bash(cmd), cmd
+
+
+def test_gh_blocks_merges_ready_approvals_and_other_repos():
+    blocked = (
+        f"gh api repos/{REPO}/pulls -X POST -f title=x -f head=tower/e1 -f base=main",           # not a draft
+        f"gh api repos/{REPO}/pulls -X POST -f title=x -f head=tower/e1 -f base=main -F draft=false",
+        f"gh api repos/{REPO}/pulls/3/merge -X PUT",
+        f"gh api repos/{REPO}/merges -f base=main -f head=tower/e1",
+        f"gh api repos/{REPO}/pulls/3/ccr/ready_for_review -X POST",
+        f"gh api repos/{REPO}/pulls/3/ccr/auto_merge -X PUT",
+        f"gh api repos/{REPO}/pulls/3/reviews -X POST -f event=APPROVE",
+        f"gh api repos/{REPO}/pulls/3 -X PATCH -f state=closed",
+        f"gh api repos/{REPO}/git/refs/heads/tower/e1 -X DELETE",
+        f"gh api repos/{REPO}/contents/rules/project.json -X PUT -f message=x",
+        f"gh api repos/{REPO}/pulls -X POST -F draft=true --input /tmp/x.json",
+        "gh api repos/someone-else/repo/pulls?state=open",
+        "gh api graphql -f query='mutation { mergePullRequest }'",
+        "gh pr merge 3", "gh pr create --draft --title x", "gh pr ready 3", "gh repo edit", "gh auth token",
+        "cd /repo && gh pr merge 3 --squash", "GH_TOKEN=x gh pr merge 1",
+    )
+    for cmd in blocked:
         assert not bash(cmd), cmd
 
 
@@ -77,6 +107,14 @@ def test_shell_writes_to_rules_blocked_on_tower_branch_only():
     assert bash("python3 -I checks/e1_slugify.py")
     assert bash("git switch tower/e2")
     assert bash("sed -i 's/a/b/' rules/project.json", branch="rules/caps")
+
+
+def test_parser_edge_cases():
+    assert not bash("echo $(gh pr merge 3)")
+    assert not bash("echo `gh pr merge 3`")
+    assert not bash("git push origin 'tower/e1")          # can't be parsed safely: blocked
+    assert bash("python3 -I checks/run_checks.py 2>/dev/null")
+    assert bash("git log --oneline | head -5")
 
 
 def test_other_shell_blocks():
