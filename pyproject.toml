@@ -1,0 +1,9 @@
+[project]
+name = "textkit"
+version = "0.0.1"
+description = "Tiny text utilities: the practice codebase for the Code Tower sandbox"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "checks", "tower", ".github/scripts", ".claude/hooks"]
+testpaths = ["tests"]

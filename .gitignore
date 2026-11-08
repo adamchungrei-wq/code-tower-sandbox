@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+.env.*
+*.pem
+*.key
+runs/
+.claude/worktrees/
+.claude/settings.local.json
