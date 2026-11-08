@@ -48,7 +48,15 @@ HEADER = re.compile(r"^(\+\+\+|---) (a/|b/|/dev/null)")
 BAD_FILE = re.compile(r"(^|/)(conftest\.py|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|sitecustomize\.py|"
                       r"usercustomize\.py|[^/]+\.pth|[^/]+\.pyc|[^/]+\.so|[^/]+\.pyd)$", re.I)
 # Files Claude Code reads as instructions or settings, at any depth.
-AGENT_FILE = re.compile(r"(^|/)(\.claude(/|$)|CLAUDE\.md$|CLAUDE\.local\.md$|\.mcp\.json$)", re.I)
+AGENT_FILE = re.compile(r"(^|/)(\.claude(/|$)|CLAUDE\.md$|CLAUDE\.local\.md$|AGENTS\.md$|\.mcp\.json$)", re.I)
+# A row PR's summary is written by a worker: no images, embeds or HTML character references (they can carry data out
+# to another server when the page is viewed), and links only to this repo, Notion and Claude Code.
+BODY_ENTITY = re.compile(r"&#|&[A-Za-z][A-Za-z0-9]{1,31};")
+BODY_IMAGE = re.compile(r"!\[|<\s*(img|image|picture|source|video|audio|iframe|embed|object|svg|link|meta)\b|"
+                        r"\bsrc\s*=|^\s{0,3}\[[^\]\n]+\]:\s*\S", re.I | re.M)
+BODY_SCHEME = re.compile(r"\b(?:https?|ftps?|wss?|data|javascript|vbscript|file|blob)\s*:", re.I)
+BODY_LINKS_OK = ("https://app.notion.com/", "https://www.notion.so/", "https://notion.so/",
+                 "https://claude.com/claude-code", "https://claude.ai/code/")
 CODE_IMPORTS = {"__future__", "re", "string", "unicodedata", "textwrap", "html", "math", "itertools", "functools",
                 "collections", "dataclasses", "enum", "textkit"}
 BAD_NAMES = {"print", "open", "exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr", "globals",
@@ -58,7 +66,9 @@ BAD_ATTRS = BAD_NAMES | {"sys", "os", "posix", "nt", "subprocess", "builtins", "
                          "popen", "shutil", "socket", "ctypes", "pty", "io", "pathlib", "runpy", "inspect", "types",
                          "gc", "pickle", "marshal", "copyreg", "atexit", "signal", "threading", "multiprocessing",
                          "site", "urllib", "http", "tempfile", "Formatter", "get_field", "get_value", "vformat",
-                         "traceback", "tb", "stdout", "stderr", "bltns"}
+                         "traceback", "tb", "stdout", "stderr", "bltns", "pkgutil", "resolve_name", "environ",
+                         "getenv", "putenv", "get_data", "import_module", "iter_modules", "walk_packages", "find_spec",
+                         "find_loader", "module_from_spec", "spec_from_file_location", "load_module", "exec_module"}
 PRIVATE_ATTR = re.compile(r"^(_|(f|tb|gi|cr|ag|co)_)")
 
 
@@ -104,6 +114,24 @@ def code_problems(path, text):
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("__"):
             found.add(f"defines {node.name}")
     return [f"{path}: {p}" for p in sorted(found)]
+
+
+def body_problems(body, repo):
+    """Why a worker-written PR summary may not stand: images, embeds, HTML character references or outside links."""
+    out = []
+    if BODY_ENTITY.search(body):
+        out.append("the PR summary has HTML character references (&#...; or &name;)")
+    if BODY_IMAGE.search(body):
+        out.append("the PR summary has an image or embed (![...], <img>, src=, or a [x]: link definition)")
+    own = f"https://github.com/{repo.lower()}"
+    for match in BODY_SCHEME.finditer(body.lower()):
+        rest = body.lower()[match.start():]
+        if repo and rest.startswith(own) and (len(rest) == len(own) or rest[len(own)] in "/)]}>\"' \t\n.,;#?"):
+            continue
+        if not any(rest.startswith(ok) for ok in BODY_LINKS_OK):
+            out.append(f"the PR summary links outside this repo, Notion and Claude Code ({rest[:40]!r})")
+            break
+    return out
 
 
 def is_tamper(path, tamper):
@@ -158,6 +186,7 @@ def problems(branch, files, diff, body, rules, labels=(), event="", code=None):
         bad_files = [f for f in files if BAD_FILE.search(f)]
         if bad_files:
             out.append("a row PR may not add pytest config, plugins or compiled files: " + ", ".join(bad_files))
+        out.extend(body_problems(body, str(rules.get("github_repo", ""))))
         agent_files = [f for f in files if AGENT_FILE.search(f)]
         if agent_files:
             out.append("a row PR may not add agent instructions or settings (CLAUDE.md, .claude/, .mcp.json): "

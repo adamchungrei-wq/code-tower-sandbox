@@ -108,8 +108,9 @@ def test_return_rows_without_a_pr_number_are_rejected():
 class FakeRun:
     """Stands in for subprocess.run: answers run_checks, git ls-remote and gh api from fixed data."""
 
-    def __init__(self, heads="", prs=(), fail=None, pr_detail=None, commit_date="2026-11-07T10:00:00Z", comments=()):
-        self.heads, self.prs, self.fail, self.calls = heads, list(prs), fail, []
+    def __init__(self, heads="", prs=(), fail=None, pr_detail=None, commit_date="2026-11-07T10:00:00Z", comments=(),
+                 common=""):
+        self.heads, self.prs, self.fail, self.calls, self.common = heads, list(prs), fail, [], common
         self.pr_detail, self.commit_date, self.comments = pr_detail or {}, commit_date, list(comments)
 
     def __call__(self, args, **kwargs):
@@ -122,6 +123,8 @@ class FakeRun:
             out = json.dumps(report())
         elif args[:2] == ["git", "ls-remote"]:
             out = self.heads
+        elif args[:2] == ["git", "rev-parse"]:
+            out = self.common
         elif route.endswith("/pulls"):
             out = json.dumps(self.prs)
         elif "/pulls/" in route:
@@ -143,6 +146,32 @@ def test_cli_gathers_checks_heads_and_prs_itself(capsys):
     assert out["selected"] == [] and out["counts"]["prs_last_24h"] == 3
     assert any(c[:2] == ["gh", "api"] and "state=all" in c for c in run.calls)
     assert any(c[:3] == ["git", "ls-remote", "--heads"] for c in run.calls)
+
+
+def test_prs_the_guard_allowed_count_until_github_lists_them():
+    # re-check #5 #2: GitHub's PR list lags a PR call by a while; the guard's ledger fills the gap
+    def at(minutes):
+        return (NOW - timedelta(minutes=minutes)).isoformat()
+    ledger = [{"head": "tower/e1", "row": "E1", "at": at(3)},           # not on GitHub yet: counts
+              {"head": "tower/e2", "row": "E2", "at": at(60)},          # GitHub lists it: counted once, from GitHub
+              {"head": "tower/e3", "row": "E3", "at": at(60 * 30)},     # older than a day
+              "junk", {"head": "tower/e4"}, {"head": "tower/e4", "at": "soon"}]
+    prs = [pr(2, "tower/e2", hours_ago=0.9)]
+    assert select_rows.pending_prs(ledger, prs, NOW) == 1
+    assert select_rows.pending_prs({"not": "a list"}, prs, NOW) == 0
+    out = select_rows.select(report(), set(), RULES, prs=prs, now=NOW, pending=2)
+    assert out["counts"]["prs_last_24h"] == 3 and out["selected"] == []
+
+
+def test_cli_counts_the_guards_ledger(tmp_path, capsys):
+    just_now = datetime.now(timezone.utc) - timedelta(minutes=2)
+    (tmp_path / "code-tower-prs.json").write_text(json.dumps(
+        [{"head": f"tower/e{n}", "row": f"E{n}", "at": just_now.isoformat()} for n in (1, 2)]))
+    assert select_rows.main([], root=ROOT, run=FakeRun(common=str(tmp_path))) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["counts"]["prs_last_24h"] == 2 and ids(out["selected"]) == ["E1"]
+    assert select_rows.main([], root=ROOT, run=FakeRun(common="relative/dir")) == 0      # never a relative path
+    assert json.loads(capsys.readouterr().out)["counts"]["prs_last_24h"] == 0
 
 
 def test_cli_takes_no_ai_supplied_evidence(tmp_path, capsys):

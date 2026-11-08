@@ -1,4 +1,4 @@
-"""PreToolUse guard for a Code Tower repo. V0.5: exact command forms and confined files, after four independent
+"""PreToolUse guard for a Code Tower repo. V0.6: exact command forms and confined files, after five independent
 checks (2026-11-07).
 
 .claude/settings.json allows or denies tools by name; this hook looks inside each call. The hook command in
@@ -8,11 +8,16 @@ exit 2 = block, reason on stderr. Any error blocks. Hooks also run when a schedu
 
 Principles: allow what the tower needs, in listed shapes; refuse everything else.
 1. Switches: main's rules/project.json decides. With "mode" other than "on", or rung 0, a run may read, write
-   runs/ct/ and file its one entry, but starts no workers and makes no commits, pushes, PRs or comments.
-2. Tools: the listed built-in tools. Agent only as a worker or checker in its own worktree, with no other options.
-   Notion fetch/search/query and one page in the Coordination Entries data source. No other app, no web.
+   runs/ct/ and file its one entry, but starts no workers and makes no commits, pushes, PRs or comments. Pushes,
+   PRs, comments and new workers also need main fetched in the last 10 minutes, so a switch Adam flips on GitHub
+   reaches a run that is already going.
+2. Tools: the listed built-in tools. Agent only as a worker or checker in its own worktree, with no other options;
+   a checker only reads. Skill only as code-tower. Notion fetch/search/query and one page in the Coordination
+   Entries data source. No other app, no web.
 3. Shell: a command runs only if the whole command matches one of FORMS: one command per call, plain words and
-   simple quoted text, no chains, cd, $, ~, globs or extra options.
+   simple quoted text, no chains, cd, $, ~, globs or extra options. The tower's own checkout stays on origin/main;
+   any checkout switches only to a commit whose .claude/settings.json is main's (Claude Code reloads hooks when
+   that file changes).
 4. Files: read and searched only inside this repo's checkout and its worktrees (plus this session's own saved
    tool results). Written only in the caller's own checkout: the tower writes runs/ct/; a worker, in its
    worktree, writes src/ and tests/ (by file type), README.md and runs/ct/. Never the loop's own rules
@@ -24,19 +29,21 @@ Principles: allow what the tower needs, in listed shapes; refuse everything else
    the guard counts GitHub's PRs plus the PRs it allowed in the last 24 hours, under a lock, so parallel calls
    can't all pass.
 6. No secrets: credential files and .git internals are never read; commit messages, PR titles, bodies and
-   entries are refused if they hold token-like text, and may link only to this repo on GitHub, to Notion and to
-   Claude Code's own pages.
+   entries are refused if they hold token-like text, images or HTML character references, and may link only to
+   this repo on GitHub, to Notion and to Claude Code's own pages.
 Known gap (disclosed in PR #1): code a worker writes and then runs (a test, say) can do anything the session's own
 credentials allow. The PR guard reads row code under src/ before merge; only GitHub branch protection (a public
 repo or a paid plan) or an OS sandbox closes the gap fully.
 """
 import fcntl
+import html
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -55,11 +62,16 @@ WRITABLE_EXT = re.compile(r"\.(py|md|txt|json|csv)$")
 STARTUP_FILE = re.compile(r"(^|/)(conftest\.py|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|sitecustomize\.py|"
                           r"usercustomize\.py|__pycache__/.*|[^/]+\.(pth|pyc|so|pyd))$", re.I)
 # Files Claude Code reads as instructions or settings, at any depth: a worker must never plant them.
-AGENT_FILE = re.compile(r"(^|/)(\.claude(/|$)|CLAUDE\.md$|CLAUDE\.local\.md$|\.mcp\.json$)", re.I)
+AGENT_FILE = re.compile(r"(^|/)(\.claude(/|$)|CLAUDE\.md$|CLAUDE\.local\.md$|AGENTS\.md$|\.mcp\.json$)", re.I)
 PLAN_BLOCK = re.compile(r"```json exit-checks[ \t]*\n(.*?)\n```", re.S)
 AGENTS = {"worker", "checker"}
 AGENT_KEYS = {"subagent_type", "isolation", "description", "prompt", "run_in_background"}
-TOOL_RESULTS = "/tmp/claude-tool-results/"        # Claude Code saves large tool outputs here, per session
+TOOL_RESULTS = "/tmp/claude-tool-results/"        # claude.ai containers keep large tool outputs here
+FRESH_SECONDS = 600                                 # main must have been fetched this recently for outward actions
+GREP_ROOTS = ("src", "tests", "checks", "tower", "rules", "runs/ct", "README.md", "PLAN.md", "CLAUDE.md")
+ENTITY = re.compile(r"&#|&[A-Za-z][A-Za-z0-9]{1,31};")
+IMAGE = re.compile(r"!\[|<\s*(img|image|picture|source|video|audio|iframe|embed|object|svg|link|meta)\b|\bsrc\s*=|"
+                   r"^\s{0,3}\[[^\]\n]+\]:\s*\S", re.I | re.M)
 MARKER = "<!-- code-tower -->"
 GH_GET_FIELDS = {"state", "per_page", "page", "sort", "direction"}
 BUILTIN_TOOLS = {"Read", "Grep", "Glob", "LS", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "BashOutput",
@@ -100,9 +112,10 @@ def block(why):
 class Env:
     """Git, GitHub and file lookups. Tests replace this with a stub."""
 
-    def __init__(self, project_dir="", session_id=""):
+    def __init__(self, project_dir="", session_id="", agent_type=""):
         self.project_dir = project_dir
         self.session_id = session_id
+        self.agent_type = agent_type
         self._cache = {}
 
     def _git(self, args, path):
@@ -185,6 +198,26 @@ class Env:
         mine = self._git(["rev-parse", "--path-format=absolute", "--git-common-dir"], self.project_dir)
         theirs = self._git(["rev-parse", "--path-format=absolute", "--git-common-dir"], path)
         return bool(mine and theirs) and os.path.realpath(mine.strip()) == os.path.realpath(theirs.strip())
+
+    def main_fetch_age(self, path):
+        """Seconds since this checkout (or the repository) last fetched main; None if it never did."""
+        ages = []
+        for flag in ("--git-dir", "--git-common-dir"):
+            out = self._git(["rev-parse", "--path-format=absolute", flag], path)
+            if not out:
+                continue
+            fetch_head = Path(out.strip()) / "FETCH_HEAD"
+            try:
+                if "branch 'main' of" in fetch_head.read_text(encoding="utf-8", errors="replace"):
+                    ages.append(time.time() - fetch_head.stat().st_mtime)
+            except OSError:
+                continue
+        return min(ages) if ages else None
+
+    def blob(self, path, ref, rel):
+        """The object id of `rel` at `ref` ('' if it isn't there)."""
+        out = self._git(["rev-parse", "-q", "--verify", f"{ref}:{rel}"], path)
+        return out.strip() if out else ""
 
     def origin_url(self, where):
         out = self._git(["remote", "get-url", "--push", "origin"], where)
@@ -352,8 +385,11 @@ def _read_refused(path, cwd, env):
     if _has_git_part(path) or _has_git_part(full):
         return "git's own files (.git) aren't read directly; use the git command forms"
     sid = str(env.session_id or "")
-    if re.fullmatch(r"[A-Za-z0-9_-]{8,80}", sid) and (full + "/").startswith(f"{TOOL_RESULTS}{sid}/"):
-        return ""
+    if re.fullmatch(r"[A-Za-z0-9_-]{8,80}", sid) and ".." not in path.split("/"):
+        home = os.path.realpath(os.path.expanduser("~"))
+        if (full + "/").startswith(f"{TOOL_RESULTS}{sid}/") or re.match(
+                rf"^{re.escape(home)}/\.claude/projects/[^/]+/{re.escape(sid)}/tool-results/", full):
+            return ""
     if not _in_scope(full, env):
         return "the tower reads only this repo's checkout and its worktrees (other files can hold secrets)"
     return ""
@@ -375,6 +411,11 @@ def _links_refused(text, repo):
     pages: an image link elsewhere would carry data out when the page is viewed."""
     if len(text) > MAX_TEXT:
         return f"too long to post ({len(text)} characters; the limit is {MAX_TEXT})"
+    if ENTITY.search(text):
+        return "HTML character references (&#...; or &name;) aren't allowed in tower-written text"
+    if IMAGE.search(text):
+        return "images and embeds (![...], <img>, src=, [x]: link definitions) aren't allowed in tower-written text"
+    text = html.unescape(text)
     low, own = text.lower(), f"https://github.com/{repo.lower()}"
     for match in SCHEME.finditer(low):
         rest = low[match.start():]
@@ -471,6 +512,29 @@ def _form(cmd, repo):
     return None
 
 
+def _stale(env, cwd):
+    """Why main isn't fresh enough for an outward action, or ''."""
+    age = env.main_fetch_age(cwd)
+    if age is None or age > FRESH_SECONDS:
+        return ("run `git fetch origin` first (a row-branch fetch doesn't count): pushes, PRs, comments and new "
+                "workers need main fetched in the last 10 minutes, so Adam's switches on GitHub reach a running night")
+    return ""
+
+
+def _switch_refused(toks, cwd, env):
+    target = toks[-1]
+    tower = os.path.realpath(env.toplevel(cwd) or cwd or ".") == os.path.realpath(env.project_dir or ".")
+    if tower and target != "origin/main":
+        return ("the tower's own checkout stays on origin/main; workers and checkers switch to row branches in "
+                "their own worktrees")
+    ref = "refs/remotes/" + target
+    mine, theirs = env.blob(cwd, MAIN, ".claude/settings.json"), env.blob(cwd, ref, ".claude/settings.json")
+    if not mine or mine != theirs:
+        return (f"{target} has a different .claude/settings.json from main's (Claude Code would reload hooks from "
+                "it), so this checkout doesn't switch to it")
+    return ""
+
+
 def _shell_read_refused(toks, cwd, env):
     args = toks[1:]
     if toks[0] in ("head", "tail"):
@@ -502,16 +566,25 @@ def _bash(cmd, cwd, env, live=True):
     name, check, part, redirect = found
     if name in WRITE_FORMS and not live:
         return block("the rules say mode off or rung 0: no commits or pushes")
+    if name in WRITE_FORMS and env.agent_type == "checker":
+        return block("a checker only reads: no branches, commits or pushes")
     toks = shlex.split(part)          # exact: the forms allow only plain words and simple quoted text
+    if name == "switch":
+        why = _switch_refused(toks, cwd, env)
+        if why:
+            return block(why)
     if check == "read":
         why = _shell_read_refused(toks, cwd, env)
         if why:
             return block(why)
     elif check == "paths" and any(".." in t.split("/") for t in toks[2:]):
         return block("no .. in paths")
-    elif check == "message" and _secretish(toks[-1]):
-        return block("the commit message holds token-like text")
+    elif check == "message" and (_secretish(toks[-1]) or _links_refused(toks[-1], repo)):
+        return block("the commit message holds token-like text or a link that isn't this repo, Notion or Claude Code")
     elif check == "push":
+        why = _stale(env, cwd)
+        if why:
+            return block(why)
         ok, why = _push(toks[2:], cwd, env)
         if not ok:
             return ok, why
@@ -599,6 +672,11 @@ def _gh_cmd(args, cwd, env, live=True):
         return block(f"gh api {method} {route or '/'} is blocked")
     if not live:
         return block("the rules say mode off or rung 0: no PRs or comments")
+    if env.agent_type == "checker":
+        return block("a checker only reads: no PRs or comments")
+    why = _stale(env, cwd)
+    if why:
+        return block(why)
     values = {}
     for flag, value in fields:
         if "=" not in value:
@@ -618,8 +696,8 @@ def _gh_cmd(args, cwd, env, live=True):
         prefix = str(env.rules(cwd).get("row_branch_prefix", "tower/"))
         if not head.startswith(prefix) or _row_id(head) not in env.plan_ids(cwd):
             return block(f"a PR's head must be {prefix}<row> for a row in main's PLAN.md")
-        if _secretish(values["title"][1]):
-            return block("the PR title holds token-like text")
+        if _secretish(values["title"][1]) or _links_refused(values["title"][1], env.repo(cwd)):
+            return block("the PR title holds token-like text or a link that isn't this repo, Notion or Claude Code")
         okb, why = _body_ok(values["body"][1], cwd, env, comment=False)
         if not okb:
             return okb, why
@@ -668,6 +746,9 @@ def _mcp(tool, inp, env):
                 return block("Notion pages may be created only in the Coordination Entries data source")
             if not isinstance(inp.get("pages"), list) or len(inp["pages"]) != 1:
                 return block("one Coordination Entry per call")
+            page = inp["pages"][0]
+            if not isinstance(page, dict) or {"cover", "icon"} & set(page) or {"cover", "icon"} & set(inp):
+                return block("a Coordination Entry has no cover or icon (they would load an outside image)")
             text = "\n".join(_strings(inp.get("pages")))
             if _secretish(text):
                 return block("the Coordination Entry holds secret-like or token-like text")
@@ -699,6 +780,12 @@ def decide(tool, inp, cwd, env=None):
             where = _full(str(inp.get("path") or cwd or env.project_dir or "."), cwd, env)
             if not env.toplevel(where) or not _in_scope(where, env):
                 return block("search only inside this repo's checkout")
+        if tool == "Grep":
+            top = env.toplevel(where)
+            rel = os.path.relpath(where, top).replace("\\", "/") if top else ".."
+            if not any(rel == r or rel.startswith(r + "/") for r in GREP_ROOTS):
+                return block("give Grep a path inside src, tests, checks, tower, rules or runs/ct (or one of "
+                             "README.md, PLAN.md, CLAUDE.md)")
         if tool == "Grep" and inp.get("glob") and not SAFE_GREP_GLOB.fullmatch(str(inp["glob"])):
             return block("Grep's glob may only pick files by extension, such as *.py or src/**/*.md")
         if tool == "Grep" and inp.get("type") and not re.fullmatch(r"[a-z]{1,12}", str(inp["type"])):
@@ -711,16 +798,23 @@ def decide(tool, inp, cwd, env=None):
         return True, "read"
     live = _live(env, cwd)
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        if env.agent_type == "checker":
+            return block("a checker only reads; its verdict is its final message")
         path = str(inp.get("file_path") or inp.get("notebook_path") or "")
         why = _write_refused(path, cwd, env, live) if path else "no path"
         return (False, why) if why else (True, "file")
     if tool == "Bash":
         return _bash(str(inp.get("command", "")), cwd, env, live)
-    if tool == "Skill" and str(inp.get("skill", "")).split(":")[-1] != "code-tower":
+    if tool == "Skill" and str(inp.get("skill", "")) != "code-tower":
         return block("the tower loads only its own skill, code-tower")
     if tool in ("Agent", "Task"):
         if not live:
             return block("the rules say mode off or rung 0: no workers or checkers")
+        if env.agent_type == "checker":
+            return block("a checker only reads; it starts no agents")
+        why = _stale(env, cwd)
+        if why:
+            return block(why)
         if inp.get("subagent_type") not in AGENTS or inp.get("isolation") != "worktree" or set(inp) - AGENT_KEYS:
             return block("start only a worker or a checker, with isolation: worktree and no other options "
                          "(description, prompt and run_in_background are fine)")
@@ -736,7 +830,8 @@ def main():
         if not isinstance(inp, dict):
             raise ValueError("tool_input is not an object")
         cwd = event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-        env = Env(os.environ.get("CLAUDE_PROJECT_DIR") or cwd, str(event.get("session_id") or ""))
+        env = Env(os.environ.get("CLAUDE_PROJECT_DIR") or cwd, str(event.get("session_id") or ""),
+                  str(event.get("agent_type") or ""))
         ok, why = decide(str(event.get("tool_name", "")), inp, cwd, env)
     except Exception as exc:  # noqa: BLE001 - any failure blocks
         print(f"Blocked by .claude/hooks/guard.py: guard error ({type(exc).__name__}: {exc}); blocking to be safe",

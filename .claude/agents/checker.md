@@ -16,7 +16,7 @@ Check, in order:
 4. No secrets, no network calls, no new dependencies. `src/` code is plain functions (no classes, `match` statements or dunder methods), imports only `re`, `string`, `unicodedata`, `textwrap`, `html`, `math`, `itertools`, `functools`, `collections`, `dataclasses`, `enum` and `textkit`, and uses no `print`, `open`, `exit`, `eval`/`exec`, `getattr`/`setattr`, `globals`/`vars`, or private (`_x`) or dunder attributes.
 5. The PR summary has What changed (plain English), Risks, How to test and Undo, and `Adam approves merge` on its own line after the Undo section.
 
-Your final message is ONE JSON object, nothing else (the tower saves it; you write no files):
+You only read: the guard refuses a checker's writes, commits, pushes, comments and agents. Your final message is ONE JSON object, nothing else (the tower saves it; you write no files):
 `{"pass": true|false, "problems": ["≤ 1 line each, fixable"], "items": [{"item": "1".."5", "met": true|false, "note": "..."}], "review_note": "≤ 6 short lines for Adam: what it does, what you checked, anything worth a look"}`
 
 Type each command exactly as plain words, ONE per call: no `&&`, `;`, `cd`, `$`, `~`, globs or extra options (the fence refuses them). Read files with the Read and Grep tools.

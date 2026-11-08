@@ -3,7 +3,7 @@ name: code-tower
 description: "Use inside a Claude Code session on a Code Tower repo (one with rules/project.json), including scheduled night runs: \"run the tower\", \"tower round\", \"night run\", \"keep the workers going\", \"run the fleet here\". Runs SENSE → SUPPLY → SELECT → DO → CHECK → CLOSE with up to 3 parallel workers and delivers draft PRs only. Not for steering claude.ai sessions through Chrome (code-sessions)."
 ---
 
-# Code tower (V0.4 DRAFT, 2026-11-07, sandbox pilot; fence V0.5 after four independent checks)
+# Code tower (V0.6 DRAFT, 2026-11-07, sandbox pilot; fence V0.6 after five independent checks)
 
 ## Why
 Objective B (Adam, 2026-11-07): a Claude Code project has its own Control Tower that acts as executive assistant and orchestrator, and runs a fleet day and night. **The outcome: Adam starts only the tower (or a schedule does). It finds the work, runs workers in parallel, checks their results, and leaves him a short list of draft PRs and asks.**
@@ -26,7 +26,9 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
   Pushes are only `git push [-u] origin HEAD:refs/heads/<row branch>` for a row in PLAN.md; workers do them, the tower never pushes.
 - **Files.** The tower writes only its own `runs/ct/`. Each worker writes only inside its own worktree: `src/` and `tests/` (Python, plus `.txt`/`.json`/`.csv`/`.md` test data), `README.md` for documentation rows, and `runs/ct/`. Never `conftest.py`, pytest config, compiled files, or `CLAUDE.md` / `.claude/` at any depth. Reads stay inside this repo's checkout and its worktrees.
 - **Subagents:** only `subagent_type: worker` or `checker`, with `isolation: worktree`, a `description` and a `prompt`, and nothing else (the guard refuses other options).
-- **Switches are enforced.** With `"mode"` other than `"on"`, or rung 0, the guard refuses workers, commits, pushes, PRs and comments; reads, `runs/ct/` and the entry still work.
+- **Switches are enforced.** With `"mode"` other than `"on"`, or rung 0, the guard refuses workers, commits, pushes, PRs and comments; reads, `runs/ct/` and the entry still work. Pushes, PRs, comments and new workers also need `git fetch origin` in the last 10 minutes, so a switch Adam flips on GitHub reaches the run: when the guard says so, fetch and retry once.
+- **The tower's own checkout stays on `origin/main`.** Read row branches with `git diff origin/main...origin/<branch>`; only workers and checkers switch to them, in their own worktrees.
+- **Posted text is plain.** Comments, PR summaries and the entry carry no images, embeds or HTML character references, and link only to this repo, Notion and Claude Code.
 
 ## Start of every round
 1. `date -u`. `git fetch origin`. `git rev-parse --is-shallow-repository`: if it prints `true`, run `git fetch --unshallow origin` (cloud sessions clone one branch, shallow, and three-dot diffs need the history). Then `git switch --detach origin/main`. *Why: the round starts from the newest rules and code, even if Adam changed them on GitHub.*
@@ -66,7 +68,7 @@ Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work
 
 ## 5. CHECK (code first, then a fresh checker)
 For each worker result:
-1. **Fetch the row branch:** `git fetch origin refs/heads/<branch>:refs/remotes/origin/<branch>` (a single-branch clone doesn't fetch it otherwise), and `git rev-parse origin/<branch>` for its head sha.
+1. **Fetch the row branch:** `git fetch origin refs/heads/<branch>:refs/remotes/origin/<branch>` (a single-branch clone doesn't fetch it otherwise), and `git rev-parse origin/<branch>` for its head sha. Then `git fetch origin`: the guard counts only fetches of main, and the checker and the comment in step 4 need one in the last 10 minutes.
 2. **CI and the PR guard:** `gh api repos/<github_repo>/commits/<head sha>/check-runs --jq '[.check_runs[] | {name, status, conclusion}]'`. If not finished, check the other rows first and look once more. Still not finished → park the row with "CI didn't finish".
 3. **Checker:** start a NEW one per row (`subagent_type: checker`, `isolation: worktree`). Give it only:
    - the row JSON from `runs/ct/select.json`

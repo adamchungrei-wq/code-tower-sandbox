@@ -192,10 +192,12 @@
       "Write(./**/.claude/**)",
       "Edit(./**/.claude/**)",
       "Write(./**/.mcp.json)",
-      "Read(/tmp/**)",
-      "Read(/etc/**)",
-      "Read(/opt/**)",
-      "Read(/mnt/**)"
+      "Read(//tmp/**)",
+      "Read(//etc/**)",
+      "Read(//opt/**)",
+      "Read(//mnt/**)",
+      "Write(./**/AGENTS.md)",
+      "Edit(./**/AGENTS.md)"
     ]
   },
   "hooks": {

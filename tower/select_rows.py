@@ -10,7 +10,8 @@ RETURNS: [{"id", "title", "pr", "branch"}]: open row PRs where Adam asked for ch
 GitHub (the PR is open on that row's branch, and a login in `requesters` commented without the tower's marker
 after the PR's newest commit) and takes the done test from PLAN.md.
 Row branches with no PR (an earlier run stopped after its push) come back as mode "recover" rows; like new rows
-they open a PR, so they count against the nightly cap. The clock is the machine's, never an argument.
+they open a PR, so they count against the nightly cap. PRs the guard has allowed but GitHub doesn't list yet (its
+ledger in the git folder) count too, so SELECT and the guard agree on the room left. The clock is the machine's.
 Prints {"selected": [...], "skipped": [...], "counts": {...}}. Exit 0 ok · 1 bad input · 2 evidence unavailable.
 """
 import json
@@ -58,6 +59,24 @@ def prs_tonight(prs, now):
     return count
 
 
+def pending_prs(ledger, prs, now):
+    """PR calls the guard allowed in the last 24 hours that GitHub doesn't list (yet): its ledger minus GitHub."""
+    seen = []
+    for pr in prs:
+        head = ((pr.get("head") or {}).get("ref")) or ""
+        when = _when(pr.get("created_at"))
+        if ROW_BRANCH.match(head) and when:
+            seen.append((head, when))
+    count = 0
+    for entry in ledger if isinstance(ledger, list) else []:
+        at = _when(entry.get("at")) if isinstance(entry, dict) else None
+        if not at or not timedelta(0) <= now - at <= timedelta(hours=24):
+            continue
+        if not any(head == entry.get("head") and when >= at - timedelta(minutes=5) for head, when in seen):
+            count += 1
+    return count
+
+
 def open_row_prs(prs):
     return {((pr.get("head") or {}).get("ref")): pr.get("number") for pr in prs
             if pr.get("state") == "open" and ROW_BRANCH.match(((pr.get("head") or {}).get("ref")) or "")}
@@ -73,7 +92,7 @@ def branch_for(row_id, rules):
     return f"{rules.get('row_branch_prefix', 'tower/')}{row_id.lower()}"
 
 
-def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branches=None):
+def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branches=None, pending=0):
     """Pure function: run_checks report, claimed IDs, rules, return rows, the PR list, the time now, and the
     claimed branch names (for recovery)."""
     now = now or datetime.now(timezone.utc)
@@ -149,7 +168,7 @@ def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branche
                               -r["value"], r["id"]))
 
     caps = rules["caps"]
-    done = prs_tonight(prs, now)
+    done = prs_tonight(prs, now) + pending
     room = max(0, min(caps["workers_per_round"], caps["draft_prs_per_night"] - done))
     fix_rows = [r for r in ready if r["mode"] == "fix"]            # fixes don't open new PRs
     new_rows = [r for r in ready if r["mode"] in ("recover", "fresh")]   # these do: they share the nightly room
@@ -178,7 +197,14 @@ def gather(root=ROOT, run=subprocess.run):
                              "-f", "per_page=100"]))
     if not isinstance(prs, list) or not isinstance(report, dict):
         raise RuntimeError("unexpected evidence shape")
-    return rules, report, heads, prs
+    ledger = []
+    try:
+        common = output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
+        if Path(common).is_absolute():                # never a path relative to wherever this runs
+            ledger = json.loads((Path(common) / "code-tower-prs.json").read_text(encoding="utf-8"))
+    except (RuntimeError, OSError, ValueError):
+        ledger = []                                   # no ledger yet: the guard still enforces the cap
+    return rules, report, heads, prs, ledger
 
 
 def _when(text):
@@ -239,12 +265,13 @@ def main(argv, root=ROOT, run=subprocess.run):
         print(json.dumps({"error": f"bad input: {exc}"}))
         return 1
     try:
-        rules, report, heads, prs = gather(root, run)
+        rules, report, heads, prs, ledger = gather(root, run)
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
         print(json.dumps({"error": f"evidence unavailable: {exc}"}))
         return 2
     kept, rejected = verified_returns(returns, rules, root, run) if returns else ([], [])
-    out = select(report, claimed_ids(heads), rules, kept, prs, None, claimed_branches(heads))
+    pending = pending_prs(ledger, prs, datetime.now(timezone.utc))
+    out = select(report, claimed_ids(heads), rules, kept, prs, None, claimed_branches(heads), pending)
     out["skipped"] = rejected + out["skipped"]
     out["counts"]["skipped"] = len(out["skipped"])
     print(json.dumps(out, indent=2))

@@ -104,6 +104,10 @@ FAKES = {
     "open a file": "open('/dev/stdout', 'w').write('E1 pass')\n",
     "match private": "match 1:\n    case object(__class__=c):\n        pass\n",
     "star import": "from re import *\n",
+    "package import machinery": "import textkit\nm = textkit.import_module('os')\n",
+    "pkgutil resolve": "import textkit\nf = textkit.pkgutil.resolve_name('os:system')\n",
+    "environment": "import string\nx = string.environ\n",
+    "module spec": "import textkit\ns = textkit.find_spec('os')\n",
 }
 
 
@@ -132,6 +136,33 @@ def test_row_prs_never_add_pytest_config_or_compiled_files():
     for f in ("tests/conftest.py", "src/conftest.py", "tests/pytest.ini", "src/textkit/x.cpython-312.pyc", "src/x.pth"):
         found = problems("tower/e1", [f], diff="--- /dev/null\n+++ b/x\n+x\n", code={})
         assert any("pytest config" in p for p in found), f
+
+
+def test_the_package_exposes_only_row_functions_and_submodules():
+    # re-check #5 #2: the export loop left import_module and iter_modules on the package for row code to call
+    import textkit
+    leftovers = {"import_module", "iter_modules", "pkgutil", "importlib", "_export_all", "_import_module",
+                 "_iter_modules", "_info", "_module", "_name", "info", "module", "name"}
+    assert not leftovers & set(vars(textkit))
+    assert textkit.__all__ and all(callable(getattr(textkit, n)) for n in textkit.__all__)
+
+
+ROW_BODY = BODY.replace("## What changed", "## What changed\nSee https://github.com/" + RULES["github_repo"] + "/pull/3.")
+
+
+def test_row_pr_summaries_are_plain_text_with_inside_links():
+    # re-check #5 #1: a summary could carry an image whose address the reader's browser fetches
+    assert problems("tower/e1", ["src/textkit/slug.py"], body=ROW_BODY) == []
+    for bad, why in (("![s](https://evil.example/s.png)", "image"), ('<img src="x">', "image"),
+                     ("[r]: https://evil.example/x", "image"), ("&#104;ttps://evil.example", "character references"),
+                     ("&lt;b&gt;", "character references"), ("see https://evil.example/x", "links outside"),
+                     ("https://github.com/someone-else/repo", "links outside"),
+                     ("https://github.com.evil.example/" + RULES["github_repo"], "links outside"),
+                     ("https://github.com@evil.example/" + RULES["github_repo"], "links outside")):
+        found = problems("tower/e1", ["src/textkit/slug.py"], body=ROW_BODY + "\n" + bad)
+        assert any(why in p for p in found), (bad, found)
+    assert problems("rules/caps", ["rules/project.json"], body=BODY + "\n![x](https://example.com/x.png)",
+                    labels=["rules-approved"]) == []             # Adam's own rules PRs aren't row summaries
 
 
 def test_the_package_auto_export_file_is_part_of_the_rules():
