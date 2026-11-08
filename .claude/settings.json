@@ -1,9 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Read",
-      "Glob",
-      "Grep",
+      "Read(./**)",
+      "Glob(./**)",
+      "Grep(./**)",
       "Edit(./**)",
       "Write(./**)",
       "mcp__Notion__notion-fetch",
@@ -13,7 +13,6 @@
       "Bash(python3 -I -m pytest*)",
       "Bash(python3 -I checks/*)",
       "Bash(python3 -I tower/select_rows.py*)",
-      "Bash(python3 -m pip install --quiet pytest)",
       "Bash(date -u*)",
       "Bash(mkdir -p runs/ct*)",
       "Bash(git status*)",
@@ -47,7 +46,11 @@
       "Bash(head -n *)",
       "Bash(tail -n *)",
       "Bash(wc -l *)",
-      "Bash(pwd)"
+      "Bash(pwd)",
+      "Bash(git fetch --unshallow origin)",
+      "Bash(git fetch origin refs/heads/tower/*)",
+      "Bash(git fetch origin refs/heads/claude/tower-*)",
+      "Bash(git rev-parse --is-shallow-repository)"
     ],
     "deny": [
       "Edit(./.claude/settings.json)",
@@ -179,7 +182,20 @@
       "Read(~/.boto)",
       "Read(~/.aws/**)",
       "Read(~/.config/gcloud/**)",
-      "Read(./.git/**)"
+      "Read(./.git/**)",
+      "Bash(python3 -m pip*)",
+      "ExitPlanMode",
+      "EnterPlanMode",
+      "EnterWorktree",
+      "Write(./**/CLAUDE.md)",
+      "Edit(./**/CLAUDE.md)",
+      "Write(./**/.claude/**)",
+      "Edit(./**/.claude/**)",
+      "Write(./**/.mcp.json)",
+      "Read(/tmp/**)",
+      "Read(/etc/**)",
+      "Read(/opt/**)",
+      "Read(/mnt/**)"
     ]
   },
   "hooks": {
@@ -189,7 +205,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(mktemp) || exit 2; git -C \"$CLAUDE_PROJECT_DIR\" show refs/remotes/origin/main:.claude/hooks/guard.py > \"$f\" 2>/dev/null || cp \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\" \"$f\" || { rm -f \"$f\"; exit 2; }; python3 -I \"$f\"; rc=$?; rm -f \"$f\"; [ \"$rc\" -eq 0 ] || exit 2"
+            "command": "f=$(mktemp) || exit 2; git -C \"$CLAUDE_PROJECT_DIR\" rev-parse -q --verify refs/remotes/origin/main >/dev/null || { rm -f \"$f\"; exit 2; }; git -C \"$CLAUDE_PROJECT_DIR\" show refs/remotes/origin/main:.claude/hooks/guard.py > \"$f\" 2>/dev/null || cp \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\" \"$f\" || { rm -f \"$f\"; exit 2; }; python3 -I \"$f\"; rc=$?; rm -f \"$f\"; [ \"$rc\" -eq 0 ] || exit 2"
           }
         ]
       }

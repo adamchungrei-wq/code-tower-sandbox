@@ -6,8 +6,9 @@ Code gathers its own evidence, so nothing the AI writes can change the count or 
   - the remote's row branches: git ls-remote --heads origin
   - every PR, open or closed: gh api repos/<repo>/pulls -X GET -f state=all -f per_page=100 (tonight's cap)
   - the rules: rules/project.json in this checkout (the tower runs detached at origin/main)
-RETURNS: [{"id", "title", "pr", "branch"}]: open row PRs where Adam asked for changes. Code checks each one (the
-branch must be that row's branch and the PR must be open on GitHub) and takes the done test from PLAN.md.
+RETURNS: [{"id", "title", "pr", "branch"}]: open row PRs where Adam asked for changes. Code checks each one on
+GitHub (the PR is open on that row's branch, and a login in `requesters` commented without the tower's marker
+after the PR's newest commit) and takes the done test from PLAN.md.
 Row branches with no PR (an earlier run stopped after its push) come back as mode "recover" rows; like new rows
 they open a PR, so they count against the nightly cap. The clock is the machine's, never an argument.
 Prints {"selected": [...], "skipped": [...], "counts": {...}}. Exit 0 ok · 1 bad input · 2 evidence unavailable.
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE_RANK = {"return": 0, "exit_gap": 1, "follow_up": 2, "free_form": 3}
 ROW_BRANCH = re.compile(r"^(tower/|claude/tower-)([a-z0-9]+)$")
 UNDO = "Close the draft PR and delete the branch."
+MARKER = "<!-- code-tower -->"
 
 
 def claimed_branches(heads_text):
@@ -179,6 +181,50 @@ def gather(root=ROOT, run=subprocess.run):
     return rules, report, heads, prs
 
 
+def _when(text):
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def verified_returns(returns, rules, root=ROOT, run=subprocess.run):
+    """Split return rows into (kept, skipped) using GitHub itself: the PR must be open on the row's branch, and a
+    requester must have asked for changes (a comment without the tower's marker) after the PR's newest commit."""
+    repo = rules["github_repo"]
+    requesters = {str(r).lower() for r in rules.get("requesters", [])}
+
+    def api(*args):
+        proc = run(["gh", "api", *args], cwd=str(root), capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            raise RuntimeError(f"gh api {args[0]} failed")
+        return json.loads(proc.stdout)
+
+    kept, skipped = [], []
+    for ret in returns:
+        rid = str(ret.get("id", "?")).upper() if isinstance(ret, dict) else "?"
+        try:
+            number = int(ret["pr"])
+            pr = api(f"repos/{repo}/pulls/{number}")
+            since = api(f"repos/{repo}/commits/{pr['head']['sha']}")["commit"]["committer"]["date"]
+            comments = api(f"repos/{repo}/issues/{number}/comments", "-X", "GET", "-f", f"since={since}",
+                           "-f", "per_page=100")
+        except (KeyError, TypeError, ValueError, RuntimeError, OSError, subprocess.SubprocessError):
+            skipped.append({"id": rid, "why": "return row rejected: couldn't confirm it on GitHub"})
+            continue
+        last_commit = _when(since)
+        asked = [c for c in comments if isinstance(c, dict)
+                 and str((c.get("user") or {}).get("login", "")).lower() in requesters
+                 and MARKER not in str(c.get("body", ""))
+                 and _when(c.get("created_at")) and last_commit and _when(c.get("created_at")) > last_commit]
+        if pr.get("state") == "open" and (pr.get("head") or {}).get("ref") == ret.get("branch") and asked:
+            kept.append(ret)
+        else:
+            skipped.append({"id": rid, "why": "return row rejected: no change request from a requester on that open "
+                                              "row PR since its newest commit"})
+    return kept, skipped
+
+
 def main(argv, root=ROOT, run=subprocess.run):
     try:
         args = list(argv)
@@ -197,7 +243,11 @@ def main(argv, root=ROOT, run=subprocess.run):
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
         print(json.dumps({"error": f"evidence unavailable: {exc}"}))
         return 2
-    print(json.dumps(select(report, claimed_ids(heads), rules, returns, prs, None, claimed_branches(heads)), indent=2))
+    kept, rejected = verified_returns(returns, rules, root, run) if returns else ([], [])
+    out = select(report, claimed_ids(heads), rules, kept, prs, None, claimed_branches(heads))
+    out["skipped"] = rejected + out["skipped"]
+    out["counts"]["skipped"] = len(out["skipped"])
+    print(json.dumps(out, indent=2))
     return 0
 
 

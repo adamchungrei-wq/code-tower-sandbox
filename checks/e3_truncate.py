@@ -14,7 +14,7 @@ CASES = [
 ]
 for args, want in CASES:
     got = truncate(*args)
-    assert got == want, f"truncate{args!r} returned {got!r}, expected {want!r}"
+    assert type(got) is str and got == want, f"truncate{args!r} returned {got!r}, expected {want!r}"
     assert len(got) <= args[1], f"truncate{args!r} is longer than the limit"
 
 try:

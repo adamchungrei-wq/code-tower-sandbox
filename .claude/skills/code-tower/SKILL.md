@@ -3,7 +3,7 @@ name: code-tower
 description: "Use inside a Claude Code session on a Code Tower repo (one with rules/project.json), including scheduled night runs: \"run the tower\", \"tower round\", \"night run\", \"keep the workers going\", \"run the fleet here\". Runs SENSE → SUPPLY → SELECT → DO → CHECK → CLOSE with up to 3 parallel workers and delivers draft PRs only. Not for steering claude.ai sessions through Chrome (code-sessions)."
 ---
 
-# Code tower (V0.3 DRAFT, 2026-11-07, sandbox pilot; fence V0.4 after three independent checks)
+# Code tower (V0.4 DRAFT, 2026-11-07, sandbox pilot; fence V0.5 after four independent checks)
 
 ## Why
 Objective B (Adam, 2026-11-07): a Claude Code project has its own Control Tower that acts as executive assistant and orchestrator, and runs a fleet day and night. **The outcome: Adam starts only the tower (or a schedule does). It finds the work, runs workers in parallel, checks their results, and leaves him a short list of draft PRs and asks.**
@@ -24,11 +24,12 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
   - quoted text (commit messages, PR titles) uses letters, digits, spaces and `: , . _ ( ) / + = -` only.
   A refused command tells you why. Correct it once; a second refusal of the same step is a stop (see Stop rules).
   Pushes are only `git push [-u] origin HEAD:refs/heads/<row branch>` for a row in PLAN.md; workers do them, the tower never pushes.
-- **Files.** The tower writes only `runs/ct/`. Workers write `src/` and `tests/` (Python, plus `.txt`/`.json`/`.csv`/`.md` test data), and `README.md` for documentation rows. Never `conftest.py`, pytest config or compiled files.
-- **Subagents:** only `subagent_type: worker` or `checker`, always with `isolation: worktree` (the guard refuses anything else).
+- **Files.** The tower writes only its own `runs/ct/`. Each worker writes only inside its own worktree: `src/` and `tests/` (Python, plus `.txt`/`.json`/`.csv`/`.md` test data), `README.md` for documentation rows, and `runs/ct/`. Never `conftest.py`, pytest config, compiled files, or `CLAUDE.md` / `.claude/` at any depth. Reads stay inside this repo's checkout and its worktrees.
+- **Subagents:** only `subagent_type: worker` or `checker`, with `isolation: worktree`, a `description` and a `prompt`, and nothing else (the guard refuses other options).
+- **Switches are enforced.** With `"mode"` other than `"on"`, or rung 0, the guard refuses workers, commits, pushes, PRs and comments; reads, `runs/ct/` and the entry still work.
 
 ## Start of every round
-1. `date -u`. `git fetch origin`, then `git switch --detach origin/main`. *Why: the round starts from the newest rules and code, even if Adam changed them on GitHub.*
+1. `date -u`. `git fetch origin`. `git rev-parse --is-shallow-repository`: if it prints `true`, run `git fetch --unshallow origin` (cloud sessions clone one branch, shallow, and three-dot diffs need the history). Then `git switch --detach origin/main`. *Why: the round starts from the newest rules and code, even if Adam changed them on GitHub.*
 2. Read `CLAUDE.md`, `PLAN.md` and `rules/project.json`. If `"mode": "off"`, stop and say so. Policy version = `git rev-parse --short origin/main`. Quote it in every row and in the entry.
 3. `mkdir -p runs/ct`. `git ls-remote --heads origin > runs/ct/heads.txt`. `gh api repos/<github_repo>/pulls -X GET -f state=all -f per_page=100 > runs/ct/prs.json`.
 4. `git status --porcelain`. If it lists any file of the loop's own rules (see Guardrails), stop: the checkout was changed outside a PR. Report it as an ask.
@@ -58,23 +59,24 @@ Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work
 - Start every selected row in ONE message: one Agent call per row, `subagent_type: worker`, `isolation: worktree`. The brief is one paragraph:
   `Job <project>-<yyyymmdd>-<row id>. Mode <fresh|fix|recover>. Row <id>: <title>. Source <source>, value <v>. Branch <branch>[, PR #<n>]. Done test: <command> must pass, and python3 -I -m pytest -q must pass. Code under src/, tests under tests/; README.md only for documentation rows. Repo <github_repo>. Policy <sha>. Boundaries unchanged: draft PR only; no merge, no ready, no push except the row branch; no edits to the loop's rules; no secrets; no web; stop and report if access is missing.` For a fix row, add the checker's problems or Adam's comment.
 - A worker that stops early gets one `SendMessage`: `Continue <Job> from where you stopped; same boundaries.` A second stop parks the row.
-- **A draft PR refused for the nightly cap** means the cap was reached: park the row with "cap reached" and start no more.
+- **A draft PR refused for the nightly cap, or because the row already has an open PR,** means stop for that row: park it with the guard's reason and start no more new rows.
 - **A push refused by the session's proxy** (an HTTP 403 on `git push`, or "not permitted through this proxy") means this session can't push row branches. Stop every worker. Report the exact error. Add one ask: "switch row_branch_prefix to claude/tower- (a rules PR), or run the tower as a desktop session?"
 
 *Why: workers in their own worktrees can't collide, and SELECT already held back rows that depend on each other. Agents working on overlapping code do worse as a team than alone.*
 
 ## 5. CHECK (code first, then a fresh checker)
 For each worker result:
-1. **CI and the PR guard:** `gh api repos/<github_repo>/commits/<head sha>/check-runs --jq '[.check_runs[] | {name, status, conclusion}]'`. If not finished, check the other rows first and look once more. Still not finished → park the row with "CI didn't finish".
-2. **Checker:** start a NEW one per row (`subagent_type: checker`, `isolation: worktree`). Give it only:
+1. **Fetch the row branch:** `git fetch origin refs/heads/<branch>:refs/remotes/origin/<branch>` (a single-branch clone doesn't fetch it otherwise), and `git rev-parse origin/<branch>` for its head sha.
+2. **CI and the PR guard:** `gh api repos/<github_repo>/commits/<head sha>/check-runs --jq '[.check_runs[] | {name, status, conclusion}]'`. If not finished, check the other rows first and look once more. Still not finished → park the row with "CI didn't finish".
+3. **Checker:** start a NEW one per row (`subagent_type: checker`, `isolation: worktree`). Give it only:
    - the row JSON from `runs/ct/select.json`
    - the branch name
    - `git diff origin/main...origin/<branch>`
    - the PR summary
  
    Never give it the worker's reasoning. Its final message is the verdict JSON: save it with the Write tool to `runs/ct/<id>-check.json`.
-3. **Pass** means every check-run concluded `success` AND the checker passed. Then write `runs/ct/<id>-note.md` (first line `<!-- code-tower -->`, then the checker's `review_note`) and post it as a comment.
-4. **Fail:** one fix round (a new worker in fix mode with the checker's problems), then a new checker. A second fail parks the row: post a comment starting with the marker, saying `Parked: <reason>`, and add an ask.
+4. **Pass** means every check-run concluded `success` AND the checker passed. Then write `runs/ct/<id>-note.md` (first line `<!-- code-tower -->`, then the checker's `review_note`) and post it as a comment.
+5. **Fail:** one fix round (a new worker in fix mode with the checker's problems), then a new checker. A second fail parks the row: post a comment starting with the marker, saying `Parked: <reason>`, and add an ask.
 
 *Why: nothing closes on the worker's word, and the checker never saw the work being made.*
 

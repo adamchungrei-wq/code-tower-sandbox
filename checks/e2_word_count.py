@@ -15,5 +15,5 @@ CASES = {
 }
 for text, want in CASES.items():
     got = word_count(text)
-    assert got == want, f"word_count({text!r}) returned {got!r}, expected {want!r}"
+    assert type(got) is int and got == want, f"word_count({text!r}) returned {got!r}, expected {want!r}"
 print("E2 pass")

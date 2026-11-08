@@ -1,6 +1,8 @@
 """The guard is the fence that holds at night. These tests pin what it blocks and what it lets through,
-including every bypass the three independent checks of 2026-11-07 found (audit rows 1-15, re-check N1-N12,
-re-check #3 blockers 1-6, should-fix 7-8 and nit 9). V0.4 allows only exact command forms."""
+including every bypass the four independent checks of 2026-11-07 found (audit rows 1-15, re-check N1-N12,
+re-check #3 findings 1-9, re-check #4 findings 1-11). V0.5: exact command forms, confined files, enforced switches,
+a locked PR ledger."""
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -17,30 +19,49 @@ HOME = os.path.expanduser("~")
 PLAN_IDS = {"E1", "E2", "E3", "E4"}
 
 
-class StubEnv(guard.Env):
-    """A repo at /repo whose branch diff, push config, body files and GitHub PR count the test controls."""
+W = "/repo/.claude/worktrees/w1"          # a worker's worktree, the way Claude Code makes it
 
-    def __init__(self, changed=(), files=None, redirects="", repo=REPO, prs_tonight=0, origin=None):
-        super().__init__(project_dir="/repo")
+
+class StubEnv(guard.Env):
+    """A repo at /repo (worktrees under /repo/.claude/worktrees/) whose rules, branch diff, push config, body files
+    and GitHub PRs the test controls."""
+
+    def __init__(self, changed=(), files=None, redirects="", repo=REPO, prs_tonight=0, origin=None, mode="on",
+                 rung=1, prefix="tower/", open_rows=(), session_id=""):
+        super().__init__(project_dir="/repo", session_id=session_id)
         self.changed, self.files, self.redirects, self._repo = list(changed), files or {}, redirects, repo
-        self.prs_tonight = prs_tonight
+        self.prs_tonight, self.open_rows = prs_tonight, set(open_rows)
         self.origin = origin if origin is not None else f"https://github.com/{REPO}.git"
+        self.mode, self.rung, self.prefix = mode, rung, prefix
 
     def toplevel(self, path):
         full = os.path.normpath(path)
-        return "/repo" if (full + "/").startswith("/repo/") and "/.git/" not in full + "/" else ""
+        if not (full + "/").startswith("/repo/") or "/.git/" in full + "/":
+            return ""
+        parts = full.split("/")
+        if parts[2:4] == [".claude", "worktrees"] and len(parts) > 4:
+            return "/".join(parts[:5])
+        return "/repo"
 
     def rules(self, path):
-        return {"github_repo": self._repo, "tamper_paths": [], "caps": {"draft_prs_per_night": 3}}
+        return {"github_repo": self._repo, "tamper_paths": [], "caps": {"draft_prs_per_night": 3}, "mode": self.mode,
+                "rung": self.rung, "row_branch_prefix": self.prefix}
 
     def plan_ids(self, path):
         return set(PLAN_IDS)
 
-    def row_prs_last_24h(self, path):
-        return self.prs_tonight
+    def reserve_pr(self, path, head, cap):
+        if self.prs_tonight is None:
+            return "couldn't read tonight's PRs on GitHub"
+        if guard._row_id(head) in self.open_rows:
+            return "that row already has an open PR"
+        return "" if self.prs_tonight < cap else "tonight's draft-PR cap is reached"
 
     def origin_url(self, where):
         return self.origin
+
+    def same_repo(self, path):
+        return (os.path.normpath(path) + "/").startswith("/repo/")
 
     def diff_names(self, where, src):
         return list(self.changed)
@@ -57,6 +78,11 @@ CLEAN = {"E1-body.md": "## What changed\nAdds slugify.\n", "E1-note.md": "<!-- c
 
 def ok(tool, inp, env=None, cwd="/repo"):
     return guard.decide(tool, inp, cwd, env or StubEnv(files=CLEAN))[0]
+
+
+def wok(tool, inp, env=None):
+    """The same call from a worker in its own worktree."""
+    return ok(tool, inp, env, cwd=W)
 
 
 def bash(cmd, env=None):
@@ -83,11 +109,12 @@ WORKFLOW = (
     "python3 -I checks/e1_slugify.py", "python3 -I -m pytest -q", "git add -A", "git add src/textkit/slug.py tests/test_slug.py",
     "git diff --cached --stat origin/main", "git commit -m 'E1: slugify(text) turns text into a URL slug'",
     "git push -u origin HEAD:refs/heads/tower/e1", PR, "git switch --detach origin/tower/e1",
-    "git push origin HEAD:refs/heads/tower/e1", "git push origin HEAD:refs/heads/claude/tower-e1",
+    "git push origin HEAD:refs/heads/tower/e1", "git fetch --unshallow origin", "git rev-parse --is-shallow-repository",
+    "git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e1", "git rev-parse origin/tower/e1",
     # checker
     "python3 -I checks/run_checks.py --only E1 --strict", "git log --oneline origin/main..HEAD", "git diff origin/main...HEAD",
     # common, harmless variants an agent types
-    "gh auth status", "python3 -m pip install --quiet pytest", "git log --oneline | head -5", "git log --oneline -3",
+    "gh auth status", "git log --oneline | head -5", "git log --oneline -3",
     "cat checks/e1_slugify.py", "head -n 20 src/textkit/whitespace.py", "ls -la src/textkit", "ls", "pwd", "git status",
     "python3 -I checks/run_checks.py 2>/dev/null", "python3 -I -m pytest -q 2>&1 | tail -5",
     "git push -u origin HEAD:refs/heads/tower/e1 2>&1", "python3 -I -m pytest -q tests/test_whitespace.py -x",
@@ -101,19 +128,38 @@ def test_prescribed_commands_pass(cmd):
     assert bash(cmd), cmd
 
 
-def test_workers_write_code_tests_readme_and_the_tower_writes_scratch_files():
-    for path in ("/repo/src/textkit/slug.py", "/repo/tests/test_slug.py", "/repo/runs/ct/E1-body.md",
-                 "/repo/README.md", "/repo/runs/ct/returns.json", "/repo/tests/data/sample.txt"):
-        assert ok("Write", {"file_path": path}), path
+def test_workers_write_code_tests_readme_in_their_worktree_and_the_tower_writes_scratch_files():
+    for rel in ("src/textkit/slug.py", "tests/test_slug.py", "runs/ct/E1-body.md", "README.md", "tests/data/sample.txt"):
+        assert wok("Write", {"file_path": f"{W}/{rel}"}), rel
+    for rel in ("runs/ct/returns.json", "runs/ct/E1-check.json", "runs/ct/E1-note.md"):
+        assert ok("Write", {"file_path": f"/repo/{rel}"}), rel
+
+
+def test_each_role_writes_only_its_own_paths():
+    # re-check #4 #2 and the known-gap detail: no writes into the tower's checkout, another worktree or another repo
+    for path in ("/repo/src/textkit/zz.py", "/repo/README.md", "/repo/.claude/worktrees/w2/src/x.py",
+                 "/repo/runs/ct/x.json", "/tmp/other-repo/tests/test_planted.py",
+                 "/home/claude/execution-workforce/README.md"):
+        assert not wok("Write", {"file_path": path}), path
+    for path in ("/repo/src/textkit/slug.py", "/repo/tests/test_x.py", "/repo/README.md", f"{W}/src/x.py",
+                 f"{W}/runs/ct/x.md"):
+        assert not ok("Write", {"file_path": path}), path       # the tower writes only its own runs/ct/
 
 
 def test_writes_elsewhere_are_refused():
-    for path in ("/repo/setup.py", "/repo/pytest.ini", "/repo/tests/pytest.ini", "/repo/tests/conftest.py",
-                 "/repo/src/conftest.py", "/repo/src/textkit/__pycache__/slug.cpython-312.pyc",
-                 "/repo/src/textkit/evil.cpython-312-x86_64-linux-gnu.so", "/repo/src/x.pth", "/repo/tests/setup.cfg",
-                 "/repo/src/sitecustomize.py", "/repo/docs/x.md", "/repo/.claude/worktrees/x.txt", "/tmp/ct-e1/x.txt",
-                 "/repo/src/textkit/__init__.py", "/repo/runs/x.json", "/repo/tests/fence/test_new.py"):
-        assert not ok("Write", {"file_path": path}), path
+    for rel in ("setup.py", "pytest.ini", "tests/pytest.ini", "tests/conftest.py", "src/conftest.py",
+                "src/textkit/__pycache__/slug.cpython-312.pyc", "src/textkit/evil.cpython-312-x86_64-linux-gnu.so",
+                "src/x.pth", "tests/setup.cfg", "src/sitecustomize.py", "docs/x.md", "src/textkit/__init__.py",
+                "runs/x.json", "tests/fence/test_new.py", "src/x.sh", "src/x.ipynb"):
+        assert not wok("Write", {"file_path": f"{W}/{rel}"}), rel
+    assert not ok("Write", {"file_path": "/tmp/ct-e1/x.txt"})
+
+
+def test_nested_agent_instructions_are_never_written():
+    # re-check #4 #5: Claude Code loads nested CLAUDE.md files as instructions
+    for rel in ("src/CLAUDE.md", "tests/CLAUDE.md", "src/textkit/CLAUDE.local.md", "src/.claude/settings.json",
+                "tests/.claude/agents/x.md", "tests/.mcp.json", "src/claude.md"):
+        assert not wok("Write", {"file_path": f"{W}/{rel}"}), rel
 
 
 # --- the loop's own rules, .git and the home folder are never written -------------------------------------
@@ -125,6 +171,7 @@ def test_protected_paths_are_never_written():
                  "src/../checks/e1_slugify.py", "Checks/e1_slugify.py", ".Claude/settings.json", ".git/config",
                  ".git/hooks/pre-push", ".git/refs/remotes/origin/main", "src/textkit/__init__.py"):
         assert not ok("Write", {"file_path": f"/repo/{path}"}), path
+        assert not wok("Write", {"file_path": f"{W}/{path}"}), path
         assert not ok("Edit", {"file_path": path}), path
 
 
@@ -132,7 +179,7 @@ def test_home_dotfiles_and_other_places_are_never_written():
     for path in (f"{HOME}/.gitconfig", f"{HOME}/.bashrc", f"{HOME}/.claude/settings.json", f"{HOME}/.claude/CLAUDE.md",
                  "/etc/hosts", "/usr/local/bin/gh", "~/.gitconfig", "~/.bashrc", "~/.claude/settings.json"):
         assert not ok("Write", {"file_path": path}), path
-        assert not ok("Edit", {"file_path": path}), path
+        assert not wok("Edit", {"file_path": path}), path
 
 
 # --- secrets ---------------------------------------------------------------------------------------------
@@ -160,6 +207,30 @@ def test_secrets_are_never_read_searched_or_printed():
     assert ok("Read", {"file_path": "/repo/PLAN.md"})
     assert ok("Grep", {"pattern": "slugify", "path": "/repo/src"})
     assert ok("Glob", {"pattern": "src/**/*.py"})
+
+
+def test_reads_stay_inside_this_repo():
+    # Cloud containers keep tokens outside the repo (a /tmp MCP config with a bearer token, an env-manager log,
+    # /etc/shadow, mounted folders). The tower reads only its checkout, its worktrees and its own saved tool results.
+    for path in ("/tmp/codesign-mcp-config.json", "/tmp/env-manager.log", "/etc/shadow", "/etc/environment",
+                 "/mnt/sandboxing/x", "/mnt/user-data/outputs/x", "/opt/env-runner/x", "/tmp/other-checkout/src/x.py",
+                 "/tmp/claude-tool-results/../codesign-mcp-config.json"):
+        assert not ok("Read", {"file_path": path}), path
+    assert ok("Read", {"file_path": "/repo/.claude/worktrees/agent-e1/src/textkit/slug.py"})
+    mine = StubEnv(session_id="35e38ca0-d2a0-5d97")
+    assert ok("Read", {"file_path": "/tmp/claude-tool-results/35e38ca0-d2a0-5d97/toolu_1.json"}, mine)
+    assert not ok("Read", {"file_path": "/tmp/claude-tool-results/other-session-1/toolu_1.json"}, mine)
+    assert not ok("Read", {"file_path": "/tmp/claude-tool-results/35e38ca0-d2a0-5d97/toolu_1.json"})
+
+
+def test_grep_globs_pick_files_by_extension_only():
+    # re-check #4 #3: Claude Code runs rg --hidden --glob !.git ... --glob <yours>; a later glob can re-include .git
+    for glob in (".en[v]", "*env", "{.git,config}", "{.git,.git/**}", "*", "**", ".git/config", "*.env", "?env",
+                 "!src", ".claude/**", "**/.credentials.*"):
+        assert not ok("Grep", {"pattern": "x", "path": "/repo", "glob": glob}), glob
+    for glob in ("*.py", "src/**/*.md", "test_*.py", "**/*.json", "tests/*.txt"):
+        assert ok("Grep", {"pattern": "x", "path": "/repo", "glob": glob}), glob
+    assert not ok("Grep", {"pattern": "x", "type": "py;rm"})
 
 
 def test_a_body_with_a_secret_or_a_comment_without_the_marker_is_not_posted():
@@ -197,6 +268,11 @@ def test_push_tricks_from_the_checks_are_blocked():
 def test_push_refused_when_the_branch_changes_rules_or_config_or_origin_redirects_it():
     push = "git push -u origin HEAD:refs/heads/tower/e1"
     assert not bash(push, StubEnv(changed=["src/x.py", ".github/workflows/x.yml"]))
+    for planted in ("src/CLAUDE.md", "tests/.claude/settings.json", "tests/conftest.py", "src/x.pth"):
+        assert not bash(push, StubEnv(changed=["src/x.py", planted])), planted
+    for origin in (f"https://evil.example/{REPO}", f"/tmp/x/{REPO}.git", f"https://github.com/{REPO}.evil.example"):
+        assert not bash(push, StubEnv(origin=origin)), origin
+    assert bash(push, StubEnv(origin=f"https://github.com/{REPO}"))
     assert not bash(push, StubEnv(redirects="remote.origin.push +refs/heads/tower/e1:refs/heads/main"))
     assert not bash(push, StubEnv(redirects=None))
     assert not bash(push, StubEnv(origin="https://github.com/someone/else.git"))
@@ -253,6 +329,49 @@ def test_tonights_pr_cap_is_counted_from_github_by_the_guard():
     assert bash(PR, StubEnv(files=CLEAN, prs_tonight=2))
     assert not bash(PR, StubEnv(files=CLEAN, prs_tonight=3))
     assert not bash(PR, StubEnv(files=CLEAN, prs_tonight=None))      # can't count → no PR
+    assert not bash(PR, StubEnv(files=CLEAN, open_rows={"E1"}))      # one open PR per row
+
+
+def test_only_mains_branch_prefix_is_accepted():
+    # re-check #4 #7: two accepted prefixes let one row get a second open PR
+    other = PR.replace("head=tower/e1", "head=claude/tower-e1")
+    assert not bash("git push origin HEAD:refs/heads/claude/tower-e1")
+    assert not bash(other)
+    flipped = StubEnv(files=CLEAN, prefix="claude/tower-")
+    assert bash("git push origin HEAD:refs/heads/claude/tower-e1", flipped)
+    assert bash(other, flipped)
+    assert not bash("git push origin HEAD:refs/heads/tower/e1", flipped)
+
+
+def test_mode_off_and_rung_zero_are_enforced():
+    # re-check #4 #6: Adam's stop switch and the observe rung were prose only
+    for env in (StubEnv(files=CLEAN, mode="off"), StubEnv(files=CLEAN, rung=0), StubEnv(files=CLEAN, mode=None)):
+        for cmd in ("git push -u origin HEAD:refs/heads/tower/e1", PR, "git commit -m 'E1: x'", "git add -A",
+                    "git switch --no-track -c tower/e1 origin/main",
+                    f"gh api repos/{REPO}/issues/3/comments -X POST -F body=@runs/ct/E1-note.md"):
+            assert not bash(cmd, env), (env.mode, env.rung, cmd)
+        assert not ok("Agent", {"subagent_type": "worker", "isolation": "worktree", "prompt": "x"}, env)
+        assert not wok("Write", {"file_path": f"{W}/src/x.py"}, env)
+        for cmd in ("git fetch origin", "python3 -I checks/run_checks.py > runs/ct/checks.json", "git status",
+                    f"gh api repos/{REPO}/pulls -X GET -f state=all -f per_page=100 > runs/ct/prs.json"):
+            assert bash(cmd, env), cmd
+        assert ok("Write", {"file_path": "/repo/runs/ct/board.md"}, env)
+        assert ok("mcp__Notion__notion-create-pages", {"parent": {"data_source_id": guard.COORD_DS},
+                                                        "pages": [{"properties": {"Entry": "mode off"}}]}, env)
+
+
+def test_token_like_text_is_not_posted_anywhere():
+    # re-check #4 #1: a bearer token of 44 base64url characters matched none of the known formats
+    token = "kQ3vX9mB2nR7tY5wZ8cF1hJ4dL6gP0sA-e_UiOoTqWx"
+    assert not bash(f"git commit -m 'E2: word count {token}'")
+    assert not bash(PR.replace("title='E1: slugify(text) turns text into a URL slug'", f"title='E1 {token}'"))
+    assert not bash(PR, StubEnv(files={"E1-body.md": f"## What changed\n{token}\n"}))
+    entry = {"parent": {"data_source_id": guard.COORD_DS}, "pages": [{"content": f"note {token}"}]}
+    assert not ok("mcp__Notion__notion-create-pages", entry)
+    footer = ("## What changed\nAdds slugify.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n"
+              "https://claude.ai/code/session_01TaeBPy7BD7Hbf98KVmEUts\n")
+    assert bash(PR, StubEnv(files={"E1-body.md": footer}))
+    assert bash("git commit -m 'E1: slugify(text) turns text into a URL slug'")
 
 
 # --- re-check #3: parser mismatches, git options, redirects, cd, option values, ~ ------------------------
@@ -282,6 +401,9 @@ RECHECK3 = (
     "python3 -I -m pytest -q -c /tmp/pytest.ini", "python3 -m pytest -q", "python3 tests/test_x.py",
     "git commit -m 'x' --no-verify", "git commit -m 'it''s'", "git commit -m 'a$(id)b'", 'git commit -m "a$(id)b"',
     'git commit -m "a`id`b"', "git add :/checks", "git add -A :(top)", "git switch --detach origin/main --force",
+    "python3 -m pip install --quiet pytest", "git fetch origin +refs/heads/tower/e1:refs/remotes/origin/tower/e1",
+    "git fetch origin refs/heads/tower/e1:refs/remotes/origin/main", "git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e2",
+    "git fetch origin tower/e1", "git fetch --depth 1 origin",
 )
 
 
@@ -293,19 +415,25 @@ def test_recheck3_command_routes_are_blocked(cmd):
 def test_monitor_slash_commands_and_unknown_tools_are_closed():
     for tool, inp in (("Monitor", {"command": f"gh api repos/{REPO}/pulls/3/merge -X PUT", "description": "x"}),
                       ("SlashCommand", {"command": "/anything"}), ("PowerShell", {"command": "x"}),
+                      ("ExitPlanMode", {"launchSwarm": True, "teammateCount": 5}), ("EnterPlanMode", {}),
+                      ("EnterWorktree", {"name": "x"}),
                       ("ReadMcpResourceTool", {}), ("ListMcpResourcesTool", {}), ("WebFetch", {"url": "x"}),
                       ("WebSearch", {"query": "x"}), ("SomeNewTool", {})):
         assert not ok(tool, inp), tool
 
 
 def test_agents_are_workers_or_checkers_in_their_own_worktree():
-    assert ok("Agent", {"subagent_type": "worker", "isolation": "worktree", "prompt": "x"})
+    assert ok("Agent", {"subagent_type": "worker", "isolation": "worktree", "prompt": "x", "description": "E1"})
     assert ok("Agent", {"subagent_type": "checker", "isolation": "worktree", "prompt": "x"})
+    for extra in ({"mode": "bypassPermissions"}, {"team_name": "t"}, {"name": "w"}, {"model": "opus"}):
+        assert not ok("Agent", {"subagent_type": "worker", "isolation": "worktree", "prompt": "x", **extra}), extra
     assert not ok("Agent", {"subagent_type": "worker", "prompt": "x"})
     assert not ok("Agent", {"subagent_type": "general-purpose", "isolation": "worktree", "prompt": "x"})
     assert not ok("Task", {"subagent_type": "claude", "prompt": "x"})
-    for tool in ("SendMessage", "Skill", "ToolSearch", "TodoWrite", "TaskCreate"):
+    for tool in ("SendMessage", "ToolSearch", "TodoWrite", "TaskCreate"):
         assert ok(tool, {}), tool
+    assert ok("Skill", {"skill": "code-tower"})
+    assert not ok("Skill", {"skill": "anthropic-skills:pr-merge-check"})
 
 
 # --- tools, MCP and web --------------------------------------------------------------------------------
@@ -329,8 +457,20 @@ def test_a_coordination_entry_links_only_to_this_repo_and_notion():
     base = {"parent": {"data_source_id": guard.COORD_DS}}
     for page in ({"properties": {"Entry": "x"}, "cover": "https://example.com/c.png?d=ZGF0YQ"},
                  {"content": "![x](https://evil.example/p.png?d=abc)"}, {"content": "see //evil.example/x"},
-                 {"content": "https://github.com/someone/else/pull/1"}, {"content": "http://github.com/" + REPO}):
+                 {"content": "https://github.com/someone/else/pull/1"}, {"content": "http://github.com/" + REPO},
+                 {"content": "![x](https:evil.example/p.png?d=abc)"}, {"content": "https:/\\evil.example/p"},
+                 {"content": "https:\\\\evil.example\\p"}, {"content": "see (//evil.example/x)"},
+                 {"content": "x" * 31000}):
         assert not ok("mcp__Notion__notion-create-pages", {**base, "pages": [page]}), page
+
+
+def test_the_link_rule_is_fast_on_long_text():
+    import time
+    start = time.monotonic()
+    for n in (10000, 29000):
+        assert guard._links_refused("a" * n, REPO) == ""
+    assert guard._links_refused("a" * 120000, REPO)                  # refused by size, not after a minute
+    assert time.monotonic() - start < 1.0
 
 
 def test_other_apps_and_web_are_closed():
@@ -345,7 +485,9 @@ def _git(*args, cwd):
                           capture_output=True, text=True).stdout
 
 
-PLAN = "# Plan\n```json exit-checks\n" + json.dumps({"checks": [{"id": "E1", "what": "x", "command": "x"}]}) + "\n```\n"
+PLAN = ("# Plan\n```json exit-checks\n"
+        + json.dumps({"checks": [{"id": i, "what": "x", "command": "x"} for i in ("E1", "E2", "E3", "E4")]}) + "\n```\n")
+RULES = {"github_repo": REPO, "mode": "on", "rung": 1, "row_branch_prefix": "tower/", "caps": {"draft_prs_per_night": 3}}
 
 
 @pytest.fixture
@@ -355,14 +497,19 @@ def real_repo(tmp_path):
     _git("init", "-q", "--bare", "-b", "main", str(remote), cwd=tmp_path)
     _git("clone", "-q", str(remote), str(work), cwd=tmp_path)
     (work / "rules").mkdir()
-    (work / "rules" / "project.json").write_text(json.dumps({"github_repo": REPO}))
+    (work / "rules" / "project.json").write_text(json.dumps(RULES))
     (work / "PLAN.md").write_text(PLAN)
     _git("add", "-A", cwd=work)
     _git("commit", "-q", "-m", "init", cwd=work)
     _git("push", "-q", "origin", "HEAD:main", cwd=work)
     _git("fetch", "-q", "origin", cwd=work)
+    # The guard requires origin to be GitHub's URL for this repo, as in a cloud session. Tests only ask the guard;
+    # anything that really moves objects uses the bare remote's path (env.lab_remote) explicitly.
+    _git("remote", "set-url", "origin", f"https://github.com/{REPO}", cwd=work)
     _git("switch", "-q", "--no-track", "-c", "tower/e1", "origin/main", cwd=work)
-    return work, guard.Env(project_dir=str(work))
+    env = guard.Env(project_dir=str(work))
+    env.lab_remote = str(remote)
+    return work, env
 
 
 def test_real_repo_push_diff_plan_row_and_git_folder(real_repo):
@@ -373,7 +520,7 @@ def test_real_repo_push_diff_plan_row_and_git_folder(real_repo):
     _git("commit", "-q", "-m", "E1", cwd=work)
     push = "git push -u origin HEAD:refs/heads/tower/e1"
     assert guard.decide("Bash", {"command": push}, str(work), env)[0]
-    assert not guard.decide("Bash", {"command": "git push -u origin HEAD:refs/heads/tower/e2"}, str(work), env)[0]
+    assert not guard.decide("Bash", {"command": "git push -u origin HEAD:refs/heads/tower/e9"}, str(work), env)[0]
     assert not guard.decide("Write", {"file_path": str(work / ".git" / "config")}, str(work), env)[0]
     assert not guard.decide("Write", {"file_path": str(work / "rules" / "project.json")}, str(work), env)[0]
     (work / ".github").mkdir()
@@ -392,7 +539,7 @@ def test_real_repo_push_config_and_origin_redirects_are_refused_but_github_ssh_r
         _git("config", key, value, cwd=work)
         assert not guard.decide("Bash", {"command": push}, str(work), env)[0], key
         _git("config", "--unset", key, cwd=work)
-    _git("remote", "set-url", "origin", "https://evil.example/other.git", cwd=work)
+    _git("remote", "set-url", "origin", f"https://evil.example/{REPO}.git", cwd=work)
     assert not guard.decide("Bash", {"command": push}, str(work), env)[0]
 
 
@@ -408,7 +555,111 @@ def test_real_repo_a_local_origin_main_branch_cannot_shadow_main(real_repo):
 
 def test_real_repo_plan_ids_come_from_main(real_repo):
     work, env = real_repo
-    assert env.plan_ids(str(work)) == {"E1"}
+    assert env.plan_ids(str(work)) == {"E1", "E2", "E3", "E4"}
+
+
+def test_real_repo_writes_stay_in_the_callers_own_checkout(real_repo, tmp_path):
+    work, env = real_repo
+    other = tmp_path / "other"
+    _git("init", "-q", str(other), cwd=tmp_path)
+    for rel in ("src/x.py", "tests/test_planted.py", "README.md"):
+        assert not guard.decide("Write", {"file_path": str(other / rel)}, str(work), env)[0], rel
+    wt = work / ".claude" / "worktrees" / "w1"
+    _git("worktree", "add", "-q", "--detach", str(wt), "origin/main", cwd=work)
+    assert guard.decide("Write", {"file_path": str(wt / "src" / "x.py")}, str(wt), env)[0]
+    assert not guard.decide("Write", {"file_path": str(work / "src" / "x.py")}, str(wt), env)[0]
+    assert not guard.decide("Write", {"file_path": str(wt / "src" / "x.py")}, str(work), env)[0]
+    assert guard.decide("Write", {"file_path": str(work / "runs" / "ct" / "x.json")}, str(work), env)[0]
+    assert not guard.decide("Read", {"file_path": str(other / "README.md")}, str(work), env)[0]
+
+
+class LedgerEnv(guard.Env):
+    """The real PR ledger and lock, with GitHub answering slowly from a fixed list."""
+
+    def __init__(self, project_dir, prs):
+        super().__init__(project_dir=project_dir)
+        self._prs = prs
+
+    def github_prs(self, path):
+        import time
+        time.sleep(0.2)                       # a slow answer widens the race the lock must close
+        return list(self._prs)
+
+
+def _pr(ref, hours_ago, state="open"):
+    from datetime import datetime, timedelta, timezone
+    when = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat().replace("+00:00", "Z")
+    return {"head": {"ref": ref}, "created_at": when, "state": state}
+
+
+def test_real_repo_parallel_pr_calls_get_one_slot(real_repo):
+    # re-check #4 #7: with 2 PRs tonight and a cap of 3, three simultaneous PR calls all passed
+    work, _ = real_repo
+    prs = [_pr("tower/x1", 1), _pr("tower/x2", 2)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda head: LedgerEnv(str(work), prs).reserve_pr(str(work), head, 3),
+                                ["tower/e2", "tower/e3", "tower/e4"]))
+    assert sorted(r == "" for r in results) == [False, False, True], results
+    env = LedgerEnv(str(work), prs)
+    assert "cap is reached" in env.reserve_pr(str(work), "tower/e1", 3)
+    assert "open PR" in LedgerEnv(str(work), [_pr("tower/e1", 30)]).reserve_pr(str(work), "tower/e1", 9)
+
+
+def test_real_repo_one_pr_per_row_even_before_github_shows_it(real_repo):
+    work, _ = real_repo
+    env = LedgerEnv(str(work), [])
+    assert env.reserve_pr(str(work), "tower/e1", 3) == ""
+    assert "a moment ago" in env.reserve_pr(str(work), "tower/e1", 3)
+
+
+def test_real_repo_shallow_single_branch_clone_can_fetch_row_branches(real_repo, tmp_path):
+    # re-check #4 #8: cloud sessions clone main only, at depth 1, so origin/tower/<id> never appears by itself
+    work, env = real_repo
+    remote = env.lab_remote
+    (work / "src").mkdir()
+    (work / "src" / "slug.py").write_text("x = 1\n")
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "E1", cwd=work)
+    _git("push", "-q", remote, "HEAD:refs/heads/tower/e1", cwd=work)
+    clone = tmp_path / "shallow"
+    _git("clone", "-q", "--depth", "1", "--single-branch", "--branch", "main", f"file://{remote}", str(clone),
+         cwd=tmp_path)
+    cenv = guard.Env(project_dir=str(clone))
+    for cmd in ("git rev-parse --is-shallow-repository", "git fetch --unshallow origin",
+                "git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e1",
+                "git switch --detach origin/tower/e1", "git diff --stat origin/main...HEAD"):
+        assert guard.decide("Bash", {"command": cmd}, str(clone), cenv)[0], cmd
+        subprocess.run(cmd.split(), cwd=clone, check=True, capture_output=True)
+    assert _git("rev-parse", "--is-shallow-repository", cwd=clone).strip() == "false"
+
+
+def _hook_command():
+    return json.loads((ROOT / ".claude" / "settings.json").read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def _run_hook(project, tool, inp):
+    payload = json.dumps({"tool_name": tool, "tool_input": inp, "cwd": str(project)})
+    return subprocess.run(["bash", "-c", _hook_command()], input=payload, text=True, capture_output=True,
+                          env={**os.environ, "CLAUDE_PROJECT_DIR": str(project)}).returncode
+
+
+def test_hook_command_runs_mains_guard_and_fails_closed_without_origin_main(real_repo, tmp_path):
+    work, env = real_repo
+    (work / ".claude" / "hooks").mkdir(parents=True)
+    (work / ".claude" / "hooks" / "guard.py").write_text((ROOT / ".claude" / "hooks" / "guard.py").read_text())
+    _git("switch", "-q", "--detach", "origin/main", cwd=work)
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "guard on main", cwd=work)
+    _git("push", "-q", env.lab_remote, "HEAD:main", cwd=work)
+    _git("fetch", "-q", env.lab_remote, "+refs/heads/main:refs/remotes/origin/main", cwd=work)
+    (work / ".claude" / "hooks" / "guard.py").write_text("import sys\nsys.exit(0)\n")      # tampered working copy
+    assert _run_hook(work, "Bash", {"command": "date -u"}) == 0
+    assert _run_hook(work, "Bash", {"command": "gh pr merge 1"}) == 2      # main's guard, not the working copy
+    lone = tmp_path / "lone"
+    _git("init", "-q", str(lone), cwd=tmp_path)
+    (lone / ".claude" / "hooks").mkdir(parents=True)
+    (lone / ".claude" / "hooks" / "guard.py").write_text("import sys\nsys.exit(0)\n")
+    assert _run_hook(lone, "Bash", {"command": "date -u"}) == 2            # no origin/main: blocked
 
 
 # --- the hook itself -----------------------------------------------------------------------------------

@@ -108,20 +108,28 @@ def test_return_rows_without_a_pr_number_are_rejected():
 class FakeRun:
     """Stands in for subprocess.run: answers run_checks, git ls-remote and gh api from fixed data."""
 
-    def __init__(self, heads="", prs=(), fail=None):
+    def __init__(self, heads="", prs=(), fail=None, pr_detail=None, commit_date="2026-11-07T10:00:00Z", comments=()):
         self.heads, self.prs, self.fail, self.calls = heads, list(prs), fail, []
+        self.pr_detail, self.commit_date, self.comments = pr_detail or {}, commit_date, list(comments)
 
     def __call__(self, args, **kwargs):
         self.calls.append(args)
         out, rc = "", 0
+        route = args[2] if args[:2] == ["gh", "api"] and len(args) > 2 else ""
         if self.fail and self.fail in " ".join(args):
             rc = 1
         elif "checks/run_checks.py" in args:
             out = json.dumps(report())
         elif args[:2] == ["git", "ls-remote"]:
             out = self.heads
-        elif args[:2] == ["gh", "api"]:
+        elif route.endswith("/pulls"):
             out = json.dumps(self.prs)
+        elif "/pulls/" in route:
+            out = json.dumps(self.pr_detail)
+        elif "/commits/" in route:
+            out = json.dumps({"commit": {"committer": {"date": self.commit_date}}})
+        elif route.endswith("/comments"):
+            out = json.dumps(self.comments)
         return subprocess.CompletedProcess(args, rc, out, "boom" if rc else "")
 
 
@@ -151,13 +159,23 @@ def test_cli_stops_when_evidence_is_unavailable(capsys):
         assert "evidence unavailable" in capsys.readouterr().out
 
 
-def test_cli_return_rows_are_still_checked_against_github(tmp_path, capsys):
+def test_cli_return_rows_are_confirmed_on_github(tmp_path, capsys):
+    # re-check #4 nit 11d: a return row now needs Adam's comment on GitHub, after the PR's newest commit
     returns = tmp_path / "returns.json"
     returns.write_text(json.dumps([{"id": "E1", "title": "x", "pr": 7, "branch": "tower/e1"}]))
-    run = FakeRun(heads="abc\trefs/heads/tower/e1\n", prs=[pr(7, "tower/e1", hours_ago=30)])
-    assert select_rows.main(["--returns", str(returns)], root=ROOT, run=run) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert [(r["id"], r["mode"]) for r in out["selected"]][:1] == [("E1", "fix")]
-    run = FakeRun(heads="abc\trefs/heads/tower/e1\n", prs=[pr(7, "tower/e1", hours_ago=30, state="closed")])
-    assert select_rows.main(["--returns", str(returns)], root=ROOT, run=run) == 0
-    assert all(r["mode"] != "fix" for r in json.loads(capsys.readouterr().out)["selected"])
+    detail = {"state": "open", "head": {"ref": "tower/e1", "sha": "abc"}}
+    adam = {"user": {"login": "adamchungrei-wq"}, "body": "Please also handle tabs.", "created_at": "2026-11-07T11:00:00Z"}
+    base = dict(heads="abc\trefs/heads/tower/e1\n", prs=[pr(7, "tower/e1", hours_ago=30)], pr_detail=detail)
+    assert select_rows.main(["--returns", str(returns)], root=ROOT, run=FakeRun(**base, comments=[adam])) == 0
+    assert [(r["id"], r["mode"]) for r in json.loads(capsys.readouterr().out)["selected"]][:1] == [("E1", "fix")]
+    for comments, detail_ in (([], detail),                                                    # nobody asked
+                              ([{**adam, "body": "<!-- code-tower -->\nChecked."}], detail),  # the tower's own note
+                              ([{**adam, "created_at": "2026-11-07T09:00:00Z"}], detail),     # before the newest commit
+                              ([{**adam, "user": {"login": "someone-else"}}], detail),          # not a requester
+                              ([adam], {**detail, "state": "closed"}),                          # PR closed
+                              ([adam], {**detail, "head": {"ref": "tower/e2", "sha": "abc"}})):  # another branch
+        run = FakeRun(**{**base, "pr_detail": detail_}, comments=comments)
+        assert select_rows.main(["--returns", str(returns)], root=ROOT, run=run) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert all(r["mode"] != "fix" for r in out["selected"]), (comments, detail_)
+        assert any("return row rejected" in s["why"] for s in out["skipped"])

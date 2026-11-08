@@ -1,4 +1,5 @@
-"""Exit check E1: slugify(text) turns text into a URL slug. Exit 0 = pass."""
+"""Exit check E1: slugify(text) turns text into a URL slug. Exit 0 = pass.
+Results must be exactly str: an object that claims to equal anything can't pass."""
 import sys
 from pathlib import Path
 
@@ -15,5 +16,5 @@ CASES = {
 }
 for text, want in CASES.items():
     got = slugify(text)
-    assert got == want, f"slugify({text!r}) returned {got!r}, expected {want!r}"
+    assert type(got) is str and got == want, f"slugify({text!r}) returned {got!r}, expected {want!r}"
 print("E1 pass")

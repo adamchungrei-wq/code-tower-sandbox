@@ -7,8 +7,9 @@ Rules:
   `rules-approved` by hand. The tower can't add labels (its fence allows reads, draft PRs and comments only).
   New commits after the label fail again until Adam removes and re-adds it (his approval covers what he saw).
 - Row PRs (tower/<id> or claude/tower-<id>) may change only worker paths and are capped in size. Their code under
-  src/ is read (never run) and may use only a short list of standard modules and no exits, printing, file access,
-  dynamic lookups or private attributes, so it can't fake an exit check. No pytest config or compiled files.
+  src/ is read (never run) and may use only a short list of standard modules: plain functions, with no classes,
+  match statements, exits, printing, file access, dynamic lookups or private attributes, so it can't fake an exit
+  check. No pytest config, compiled files or agent instructions (CLAUDE.md, .claude/) at any depth.
 - No secret-like text in added lines or in the PR summary; no secret files.
 - The summary has the four sections and the approval line after Undo.
 
@@ -46,6 +47,8 @@ HEADER = re.compile(r"^(\+\+\+|---) (a/|b/|/dev/null)")
 # Files that change how Python or pytest starts (config, plugins, compiled code) are never part of a row PR.
 BAD_FILE = re.compile(r"(^|/)(conftest\.py|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|sitecustomize\.py|"
                       r"usercustomize\.py|[^/]+\.pth|[^/]+\.pyc|[^/]+\.so|[^/]+\.pyd)$", re.I)
+# Files Claude Code reads as instructions or settings, at any depth.
+AGENT_FILE = re.compile(r"(^|/)(\.claude(/|$)|CLAUDE\.md$|CLAUDE\.local\.md$|\.mcp\.json$)", re.I)
 CODE_IMPORTS = {"__future__", "re", "string", "unicodedata", "textwrap", "html", "math", "itertools", "functools",
                 "collections", "dataclasses", "enum", "textkit"}
 BAD_NAMES = {"print", "open", "exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr", "globals",
@@ -55,7 +58,7 @@ BAD_ATTRS = BAD_NAMES | {"sys", "os", "posix", "nt", "subprocess", "builtins", "
                          "popen", "shutil", "socket", "ctypes", "pty", "io", "pathlib", "runpy", "inspect", "types",
                          "gc", "pickle", "marshal", "copyreg", "atexit", "signal", "threading", "multiprocessing",
                          "site", "urllib", "http", "tempfile", "Formatter", "get_field", "get_value", "vformat",
-                         "traceback", "tb", "stdout", "stderr"}
+                         "traceback", "tb", "stdout", "stderr", "bltns"}
 PRIVATE_ATTR = re.compile(r"^(_|(f|tb|gi|cr|ag|co)_)")
 
 
@@ -94,8 +97,12 @@ def code_problems(path, text):
             found.add(f"uses {node.id}")
         elif isinstance(node, ast.Attribute) and (PRIVATE_ATTR.match(node.attr) or node.attr in BAD_ATTRS):
             found.add(f"uses .{node.attr}")
-        elif isinstance(node, ast.MatchClass) and any(k.startswith("_") for k in node.kwd_attrs):
-            found.add("matches private attributes")
+        elif isinstance(node, ast.Match):
+            found.add("uses a match statement (class patterns read attributes by name)")
+        elif isinstance(node, ast.ClassDef):
+            found.add(f"defines class {node.name} (row code is plain functions)")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("__"):
+            found.add(f"defines {node.name}")
     return [f"{path}: {p}" for p in sorted(found)]
 
 
@@ -151,6 +158,10 @@ def problems(branch, files, diff, body, rules, labels=(), event="", code=None):
         bad_files = [f for f in files if BAD_FILE.search(f)]
         if bad_files:
             out.append("a row PR may not add pytest config, plugins or compiled files: " + ", ".join(bad_files))
+        agent_files = [f for f in files if AGENT_FILE.search(f)]
+        if agent_files:
+            out.append("a row PR may not add agent instructions or settings (CLAUDE.md, .claude/, .mcp.json): "
+                       + ", ".join(agent_files))
         src_py = [f for f in files if f.startswith("src/") and f.endswith(".py") and f not in touched]
         code = code if code is not None else {}
         for f in src_py:

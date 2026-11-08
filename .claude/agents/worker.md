@@ -10,9 +10,9 @@ You are a Worker for this repo's Code Tower. You get one brief for one row. The 
 - No `&&`, `;`, `cd`, `$`, `~`, globs, heredocs or extra options (`2>&1` and `| tail -n N` are fine). You're already in your own worktree.
 - Read and search with the Read, Grep and Glob tools; edit with Edit and Write, not the shell.
 - Commit messages and PR titles: letters, digits, spaces and `: , . _ ( ) / + = -` only.
-- Write only `src/` (Python), `tests/` (Python, plus `.txt`/`.json`/`.csv`/`.md` data) and `README.md`. Never `conftest.py`, `src/textkit/__init__.py`, pytest config or compiled files.
+- Write only inside your own worktree: `src/` (Python), `tests/` (Python, plus `.txt`/`.json`/`.csv`/`.md` data), `README.md` and `runs/ct/`. Never `conftest.py`, `src/textkit/__init__.py`, pytest config, compiled files, or `CLAUDE.md` / `.claude/` at any depth.
 
-**Code rule (the PR guard reads every row's `src/` code):** import only `re`, `string`, `unicodedata`, `textwrap`, `html`, `math`, `itertools`, `functools`, `collections`, `dataclasses`, `enum` and `textkit`. No `print`, `open`, `exit`, `eval`/`exec`, `getattr`/`setattr`, `globals`/`vars`, and no private (`_x`) or dunder attributes. Tests import `pytest` and `textkit`, and take no fixtures (use `pytest.mark.parametrize`).
+**Code rule (the PR guard reads every row's `src/` code):** plain functions only: no classes, no `match` statements, no dunder methods. Import only `re`, `string`, `unicodedata`, `textwrap`, `html`, `math`, `itertools`, `functools`, `collections`, `dataclasses`, `enum` and `textkit`. No `print`, `open`, `exit`, `eval`/`exec`, `getattr`/`setattr`, `globals`/`vars`, and no private (`_x`) or dunder attributes. Tests import `pytest` and `textkit`, and take no fixtures (use `pytest.mark.parametrize`).
 
 **Fresh mode** (a new row):
 1. `git fetch origin`. If `git ls-remote --heads origin <branch>` lists the row branch, stop and report "claimed". Otherwise `git switch --no-track -c <branch> origin/main`.
@@ -32,15 +32,15 @@ You are a Worker for this repo's Code Tower. You get one brief for one row. The 
    - then `Adam approves merge` on its own line
 7. Open the DRAFT PR (Claude Code sessions block GraphQL, so `gh pr create` fails):
    `gh api repos/<github_repo>/pulls -X POST -f title='<row id>: <title>' -f head=<branch> -f base=main -F draft=true -F body=@runs/ct/<row id>-body.md --jq '{number, html_url}'`
-   If it fails, stop and report the error (a refusal for tonight's cap included).
+   If it fails, stop and report the error (a refusal for tonight's cap, or for a row that already has an open PR, included).
 
 **Fix mode** (a checker's problems, or Adam's comment, on an existing row PR):
-1. `git fetch origin`, then `git switch --detach origin/<branch>`.
+1. `git fetch origin refs/heads/<branch>:refs/remotes/origin/<branch>`, then `git switch --detach origin/<branch>`.
 2. Fix exactly what the brief lists. Re-run the done test and pytest; both must pass.
 3. `git add -A`, `git commit -m '<row id>: <what you fixed>'`, then `git push origin HEAD:refs/heads/<branch>`. Don't open a new PR.
 
 **Recover mode** (an earlier run pushed the branch but opened no PR):
-1. `git fetch origin`, then `git switch --detach origin/<branch>`.
+1. `git fetch origin refs/heads/<branch>:refs/remotes/origin/<branch>`, then `git switch --detach origin/<branch>`.
 2. Run the done test and pytest. If either fails, stop and report it; don't change anything.
 3. Write the summary and open the draft PR exactly as in fresh mode, steps 6–7. No commit, no push.
 
