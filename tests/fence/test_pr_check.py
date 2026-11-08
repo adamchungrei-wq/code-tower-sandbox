@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import pr_check
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -9,8 +11,11 @@ BODY = (ROOT / ".github" / "pull_request_template.md").read_text(encoding="utf-8
 CODE_DIFF = "--- a/src/textkit/slug.py\n+++ b/src/textkit/slug.py\n+def slugify(text):\n+    return text\n"
 
 
-def problems(branch, files, diff=CODE_DIFF, body=BODY, labels=()):
-    return pr_check.problems(branch, files, diff, body, RULES, labels)
+def problems(branch, files, diff=CODE_DIFF, body=BODY, labels=(), code=None):
+    if code is None:      # the PR guard copies each changed src/ file from the PR head; mimic that from the diff
+        code = {f: "".join(l[1:] + "\n" for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
+                for f in files if f.startswith("src/") and f.endswith(".py")}
+    return pr_check.problems(branch, files, diff, body, RULES, labels, code=code)
 
 
 def test_clean_row_pr_passes():
@@ -75,3 +80,69 @@ def test_row_code_that_could_fake_a_check_is_flagged():
     found = problems("tower/e1", ["src/textkit/zz_helpers.py"], diff=diff)
     assert any("exits early" in p for p in found)
     assert problems("tower/e1", ["src/textkit/slug.py"]) == []
+
+
+# --- re-check #3 should-fix 7: row code under src/ is read, never run, and can't fake a check ------------
+SLUG = ("import re\nimport unicodedata\n\n__all__ = ['slugify']\n\n\ndef slugify(text: str) -> str:\n"
+        "    \"\"\"Lower-case, ASCII, words joined by hyphens.\"\"\"\n"
+        "    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode()\n"
+        "    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')\n")
+FAKES = {
+    "aliased exit": "import os as o\nprint('E1 pass')\no._exit(0)\n",
+    "from-import exit": "from os import _exit as q\nq(0)\n",
+    "sys exit": "import sys\nsys.exit(0)\n",
+    "raise SystemExit": "raise SystemExit(0)\n",
+    "builtins exit": "exit(0)\n",
+    "print the pass line": "def slugify(t):\n    print('E1 pass')\n",
+    "dunder walk": "x = (lambda: 0).__globals__['__builtins__']\n",
+    "frame walk": "g = (i for i in [])\nb = g.gi_frame.f_globals\n",
+    "module chain": "import re\nre.enum.sys.modules['os'].system('x')\n",
+    "string formatter": "import string\nstring.Formatter().get_field('0.__globals__', [len], {})\n",
+    "getattr": "import re\ngetattr(re, 'compile')\n",
+    "dynamic import": "m = __import__('os')\n",
+    "importlib": "import importlib\nimportlib.import_module('os')\n",
+    "open a file": "open('/dev/stdout', 'w').write('E1 pass')\n",
+    "match private": "match 1:\n    case object(__class__=c):\n        pass\n",
+    "star import": "from re import *\n",
+}
+
+
+def code_problems_for(text, path="src/textkit/slug.py"):
+    diff = f"--- /dev/null\n+++ b/{path}\n" + "".join("+" + l + "\n" for l in text.splitlines())
+    return problems("tower/e1", [path], diff=diff, labels=(), code={path: text})
+
+
+def test_plain_row_code_passes_the_code_rule():
+    assert code_problems_for(SLUG) == []
+
+
+@pytest.mark.parametrize("name", sorted(FAKES))
+def test_code_that_could_fake_a_check_fails(name):
+    found = code_problems_for(FAKES[name])
+    assert any("fake a check" in p or "exits early" in p for p in found), (name, found)
+
+
+def test_changed_src_code_the_guard_could_not_read_fails():
+    diff = "--- /dev/null\n+++ b/src/textkit/slug.py\n+x = 1\n"
+    found = problems("tower/e1", ["src/textkit/slug.py"], diff=diff, code={})
+    assert any("couldn't read" in p for p in found)
+
+
+def test_row_prs_never_add_pytest_config_or_compiled_files():
+    for f in ("tests/conftest.py", "src/conftest.py", "tests/pytest.ini", "src/textkit/x.cpython-312.pyc", "src/x.pth"):
+        found = problems("tower/e1", [f], diff="--- /dev/null\n+++ b/x\n+x\n", code={})
+        assert any("pytest config" in p for p in found), f
+
+
+def test_the_package_auto_export_file_is_part_of_the_rules():
+    found = problems("tower/e1", ["src/textkit/__init__.py"], code={"src/textkit/__init__.py": "x = 1\n"})
+    assert any("never change the loop's own rules" in p for p in found)
+
+
+def test_new_commits_after_the_label_need_a_fresh_label():
+    assert problems("rules/caps", ["rules/project.json"], labels=["rules-approved"]) == []
+    found = pr_check.problems("rules/caps", ["rules/project.json"], CODE_DIFF, BODY, RULES, ["rules-approved"],
+                              event="synchronize")
+    assert any("re-adds the label" in p for p in found)
+    assert pr_check.problems("rules/caps", ["rules/project.json"], CODE_DIFF, BODY, RULES, ["rules-approved"],
+                             event="labeled") == []

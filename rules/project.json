@@ -20,7 +20,7 @@
     "run_minutes": 45,
     "weekly_usage_stop_percent": 85
   },
-  "tamper_paths": [".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/", ".claude/agents/", ".claude/skills/", ".claude/commands/", ".github/", ".gitignore", "rules/", "checks/", "tower/", "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml"],
+  "tamper_paths": [".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/", ".claude/agents/", ".claude/skills/", ".claude/commands/", ".github/", ".gitignore", "rules/", "checks/", "tower/", "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml", "src/textkit/__init__.py"],
   "worker_paths": ["src/", "tests/", "README.md"],
   "switches": {"look_ahead": false, "prep_rows": false},
   "requesters": ["adamchungrei-wq"],

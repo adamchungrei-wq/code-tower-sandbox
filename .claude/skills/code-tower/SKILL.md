@@ -3,7 +3,7 @@ name: code-tower
 description: "Use inside a Claude Code session on a Code Tower repo (one with rules/project.json), including scheduled night runs: \"run the tower\", \"tower round\", \"night run\", \"keep the workers going\", \"run the fleet here\". Runs SENSE → SUPPLY → SELECT → DO → CHECK → CLOSE with up to 3 parallel workers and delivers draft PRs only. Not for steering claude.ai sessions through Chrome (code-sessions)."
 ---
 
-# Code tower (V0.2 DRAFT, 2026-11-07, sandbox pilot; hardened after the independent audit)
+# Code tower (V0.3 DRAFT, 2026-11-07, sandbox pilot; fence V0.4 after three independent checks)
 
 ## Why
 Objective B (Adam, 2026-11-07): a Claude Code project has its own Control Tower that acts as executive assistant and orchestrator, and runs a fleet day and night. **The outcome: Adam starts only the tower (or a schedule does). It finds the work, runs workers in parallel, checks their results, and leaves him a short list of draft PRs and asks.**
@@ -18,11 +18,14 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
   - a draft PR: `gh api repos/<github_repo>/pulls -X POST -f title='…' -f head=<row branch> -f base=main -F draft=true -F body=@runs/ct/<id>-body.md --jq '{number, html_url}'`
   - a comment: `gh api repos/<github_repo>/issues/<n>/comments -X POST -F body=@runs/ct/<file>.md`
 - **Every comment the tower posts starts with `<!-- code-tower -->`** (the guard refuses a comment without it). SUPPLY ignores comments that carry it.
-- **The fence allows only exact command forms.** Type each command as its own call, in plain words:
-  - no `$`, variables, `$(…)`, backticks, `~` or globs;
-  - no `&&` chains around git or gh;
-  - edit files with the Edit and Write tools.
-  Pushes are only `git push [-u] origin HEAD:refs/heads/<row branch>`; workers do them, the tower never pushes.
+- **The fence allows only exact command forms** (`.claude/hooks/guard.py`, `FORMS`). Type each command exactly as this skill writes it, ONE per call:
+  - no `&&`, `;`, `cd`, `$`, `~`, globs, heredocs or extra options; `2>&1` and `| head -n N` / `| tail -n N` are fine;
+  - read and search files with the Read, Grep and Glob tools; edit them with Edit and Write;
+  - quoted text (commit messages, PR titles) uses letters, digits, spaces and `: , . _ ( ) / + = -` only.
+  A refused command tells you why. Correct it once; a second refusal of the same step is a stop (see Stop rules).
+  Pushes are only `git push [-u] origin HEAD:refs/heads/<row branch>` for a row in PLAN.md; workers do them, the tower never pushes.
+- **Files.** The tower writes only `runs/ct/`. Workers write `src/` and `tests/` (Python, plus `.txt`/`.json`/`.csv`/`.md` test data), and `README.md` for documentation rows. Never `conftest.py`, pytest config or compiled files.
+- **Subagents:** only `subagent_type: worker` or `checker`, always with `isolation: worktree` (the guard refuses anything else).
 
 ## Start of every round
 1. `date -u`. `git fetch origin`, then `git switch --detach origin/main`. *Why: the round starts from the newest rules and code, even if Adam changed them on GitHub.*
@@ -45,9 +48,9 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
 Free-form ideas: at most `free_form_proposals_per_run`, written in the entry as proposals, never worked. *Why: the loop works only from rules a person approved. It can propose new rules; it never adopts them.*
 
 ## 3. SELECT (code)
-`python3 -I tower/select_rows.py runs/ct/checks.json runs/ct/heads.txt --prs runs/ct/prs.json --returns runs/ct/returns.json > runs/ct/select.json` (leave out `--returns` when there are none; the script uses the machine's clock)
+`python3 -I tower/select_rows.py --returns runs/ct/returns.json > runs/ct/select.json` (leave out `--returns runs/ct/returns.json` when there are none). The script gathers its own evidence: it runs the exit checks, lists the remote's row branches, and reads GitHub's PR list for tonight's count, on the machine's clock.
 
-Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work and counts tonight's PRs; the AI that will do the work never picks it or sets its own cap.*
+Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work and counts tonight's PRs from GitHub; the AI that will do the work never picks it, sets its own cap or supplies the evidence. The guard also refuses a draft PR once tonight's cap is reached.*
 
 ## 4. DO (workers, in parallel)
 - **Pre-flight first:** `gh api repos/<github_repo> --jq .full_name`, and a Notion fetch of the Coordination Entries data source (`rules/project.json` → coordination). If either fails, stop the round with that reason; start no worker.
@@ -55,6 +58,7 @@ Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work
 - Start every selected row in ONE message: one Agent call per row, `subagent_type: worker`, `isolation: worktree`. The brief is one paragraph:
   `Job <project>-<yyyymmdd>-<row id>. Mode <fresh|fix|recover>. Row <id>: <title>. Source <source>, value <v>. Branch <branch>[, PR #<n>]. Done test: <command> must pass, and python3 -I -m pytest -q must pass. Code under src/, tests under tests/; README.md only for documentation rows. Repo <github_repo>. Policy <sha>. Boundaries unchanged: draft PR only; no merge, no ready, no push except the row branch; no edits to the loop's rules; no secrets; no web; stop and report if access is missing.` For a fix row, add the checker's problems or Adam's comment.
 - A worker that stops early gets one `SendMessage`: `Continue <Job> from where you stopped; same boundaries.` A second stop parks the row.
+- **A draft PR refused for the nightly cap** means the cap was reached: park the row with "cap reached" and start no more.
 - **A push refused by the session's proxy** (an HTTP 403 on `git push`, or "not permitted through this proxy") means this session can't push row branches. Stop every worker. Report the exact error. Add one ask: "switch row_branch_prefix to claude/tower- (a rules PR), or run the tower as a desktop session?"
 
 *Why: workers in their own worktrees can't collide, and SELECT already held back rows that depend on each other. Agents working on overlapping code do worse as a team than alone.*

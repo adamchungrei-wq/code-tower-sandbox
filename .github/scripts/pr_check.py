@@ -5,16 +5,22 @@ PR's code.
 Rules:
 - Any PR that changes the loop's own rules (tamper paths) fails unless Adam has added the label
   `rules-approved` by hand. The tower can't add labels (its fence allows reads, draft PRs and comments only).
-- Row PRs (tower/<id> or claude/tower-<id>) may change only worker paths and are capped in size.
+  New commits after the label fail again until Adam removes and re-adds it (his approval covers what he saw).
+- Row PRs (tower/<id> or claude/tower-<id>) may change only worker paths and are capped in size. Their code under
+  src/ is read (never run) and may use only a short list of standard modules and no exits, printing, file access,
+  dynamic lookups or private attributes, so it can't fake an exit check. No pytest config or compiled files.
 - No secret-like text in added lines or in the PR summary; no secret files.
 - The summary has the four sections and the approval line after Undo.
 
 Usage: python3 -I pr_check.py --branch REF --files FILES.txt --diff DIFF.txt --body BODY.txt --rules PROJECT.json
-                              [--labels "a,b"]
+                              [--labels "a,b"] [--event ACTION] [--code DIR]
+  --code DIR   the PR's changed src/ Python files, copied from the PR head as data (DIR/src/...)
 Prints one problem per line. Exit 1 if any (the check fails) · 0 if none.
 """
 import argparse
+import ast
 import json
+import os
 import re
 import sys
 
@@ -24,7 +30,7 @@ RULES_LABEL = "rules-approved"
 ROW_BRANCH = re.compile(r"^(tower/|claude/tower-)[a-z0-9]+$")
 DEFAULT_TAMPER = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/", ".claude/agents/",
                   ".claude/skills/", ".claude/commands/", ".github/", ".gitignore", "rules/", "checks/", "tower/",
-                  "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml")
+                  "tests/fence/", "PLAN.md", "CLAUDE.md", "pyproject.toml", "src/textkit/__init__.py")
 SECRETS = (
     ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("AWS key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -37,6 +43,20 @@ SECRETS = (
 )
 SECRET_FILE = re.compile(r"(^|/)(\.env(\.[^/]*)?|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|credentials[^/]*)$", re.I)
 HEADER = re.compile(r"^(\+\+\+|---) (a/|b/|/dev/null)")
+# Files that change how Python or pytest starts (config, plugins, compiled code) are never part of a row PR.
+BAD_FILE = re.compile(r"(^|/)(conftest\.py|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|sitecustomize\.py|"
+                      r"usercustomize\.py|[^/]+\.pth|[^/]+\.pyc|[^/]+\.so|[^/]+\.pyd)$", re.I)
+CODE_IMPORTS = {"__future__", "re", "string", "unicodedata", "textwrap", "html", "math", "itertools", "functools",
+                "collections", "dataclasses", "enum", "textkit"}
+BAD_NAMES = {"print", "open", "exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr", "globals",
+             "locals", "vars", "breakpoint", "input", "exit", "quit", "help", "memoryview", "SystemExit",
+             "BaseException", "KeyboardInterrupt", "GeneratorExit"}
+BAD_ATTRS = BAD_NAMES | {"sys", "os", "posix", "nt", "subprocess", "builtins", "importlib", "modules", "system",
+                         "popen", "shutil", "socket", "ctypes", "pty", "io", "pathlib", "runpy", "inspect", "types",
+                         "gc", "pickle", "marshal", "copyreg", "atexit", "signal", "threading", "multiprocessing",
+                         "site", "urllib", "http", "tempfile", "Formatter", "get_field", "get_value", "vformat",
+                         "traceback", "tb", "stdout", "stderr"}
+PRIVATE_ATTR = re.compile(r"^(_|(f|tb|gi|cr|ag|co)_)")
 
 
 SUSPICIOUS = re.compile(r"\b(os\._exit|sys\.exit|SystemExit|atexit|sys\.argv|sys\.modules|__builtins__|builtins|"
@@ -54,6 +74,31 @@ def suspicious_src_lines(diff):
     return found
 
 
+def code_problems(path, text):
+    """Why row code could fake an exit check or reach past the fence; [] if it can't. Reads the code, never runs it.
+    Not a sandbox: it refuses the known routes (exits, printing, files, dynamic lookups, private attributes)."""
+    try:
+        tree = ast.parse(text, filename=path)
+    except (SyntaxError, ValueError) as exc:
+        return [f"{path}: doesn't parse ({exc})"]
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(f"imports {a.name}" for a in node.names if a.name not in CODE_IMPORTS)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module not in CODE_IMPORTS:
+                found.add(f"imports from {node.module}")
+            found.update(f"imports {a.name}" for a in node.names
+                         if a.name == "*" or a.name.startswith("_") or a.name in BAD_ATTRS)
+        elif isinstance(node, ast.Name) and (node.id in BAD_NAMES or (node.id.startswith("__") and node.id != "__all__")):
+            found.add(f"uses {node.id}")
+        elif isinstance(node, ast.Attribute) and (PRIVATE_ATTR.match(node.attr) or node.attr in BAD_ATTRS):
+            found.add(f"uses .{node.attr}")
+        elif isinstance(node, ast.MatchClass) and any(k.startswith("_") for k in node.kwd_attrs):
+            found.add("matches private attributes")
+    return [f"{path}: {p}" for p in sorted(found)]
+
+
 def is_tamper(path, tamper):
     for item in tamper:
         if item.endswith("/"):
@@ -64,8 +109,9 @@ def is_tamper(path, tamper):
     return False
 
 
-def problems(branch, files, diff, body, rules, labels=()):
-    """Pure function: every problem with this PR, as plain one-line strings."""
+def problems(branch, files, diff, body, rules, labels=(), event="", code=None):
+    """Pure function: every problem with this PR, as plain one-line strings. `code` maps changed src/ paths to
+    their text at the PR head."""
     out = []
     lines = diff.splitlines()
     added = [l[1:] for l in lines if l.startswith("+") and not HEADER.match(l)]
@@ -83,6 +129,9 @@ def problems(branch, files, diff, body, rules, labels=()):
     if touched and RULES_LABEL not in labels:
         out.append("this PR changes the loop's own rules (" + ", ".join(touched) + "); it passes only after Adam "
                    f"adds the '{RULES_LABEL}' label")
+    elif touched and event == "synchronize":
+        out.append(f"new commits after '{RULES_LABEL}': Adam's approval covers what he saw, so he removes and "
+                   "re-adds the label once he has looked at them")
     if ROW_BRANCH.match(branch):
         if touched:
             out.append("a row PR may never change the loop's own rules: " + ", ".join(touched))
@@ -99,6 +148,19 @@ def problems(branch, files, diff, body, rules, labels=()):
         if flagged:
             out.append("a row PR adds code that exits early, reads argv, or reaches the network or imports "
                        "(Adam reads it before any merge): " + "; ".join(flagged[:3]))
+        bad_files = [f for f in files if BAD_FILE.search(f)]
+        if bad_files:
+            out.append("a row PR may not add pytest config, plugins or compiled files: " + ", ".join(bad_files))
+        src_py = [f for f in files if f.startswith("src/") and f.endswith(".py") and f not in touched]
+        code = code if code is not None else {}
+        for f in src_py:
+            if f not in code:
+                if any(l.startswith(f"+++ b/{f}") for l in lines):      # added or changed, but not supplied
+                    out.append(f"{f}: the PR guard couldn't read this file, so it can't check it")
+                continue
+            found = code_problems(f, code[f])
+            if found:
+                out.append("row code could fake a check or reach past the fence: " + "; ".join(found[:4]))
     for heading in REQUIRED:
         if heading not in body:
             out.append(f"the PR summary is missing '{heading}'")
@@ -114,17 +176,26 @@ def main(argv):
     for flag in ("--branch", "--files", "--diff", "--body", "--rules"):
         ap.add_argument(flag, required=True)
     ap.add_argument("--labels", default="")
+    ap.add_argument("--event", default="")
+    ap.add_argument("--code", default="")
     a = ap.parse_args(argv)
     try:
         files = [f.strip() for f in open(a.files, encoding="utf-8") if f.strip()]
         diff = open(a.diff, encoding="utf-8", errors="replace").read()
         body = open(a.body, encoding="utf-8", errors="replace").read()
         rules = json.load(open(a.rules, encoding="utf-8"))
+        code = {}
+        if a.code:
+            for folder, _dirs, names in os.walk(a.code):
+                for name in names:
+                    full = os.path.join(folder, name)
+                    code[os.path.relpath(full, a.code).replace(os.sep, "/")] = open(
+                        full, encoding="utf-8", errors="replace").read()
     except (OSError, ValueError) as exc:
         print(f"pr-guard: can't read inputs ({exc}); failing closed")
         return 1
     labels = [l.strip() for l in a.labels.split(",") if l.strip()]
-    found = problems(a.branch, files, diff, body, rules, labels)
+    found = problems(a.branch, files, diff, body, rules, labels, a.event, code if a.code else None)
     for p in found:
         print(p)
     if not found:

@@ -1,18 +1,20 @@
 """SELECT: pick the rows the tower works this round. Code decides; the AI that will do the work never picks it.
 
-Usage: python3 -I tower/select_rows.py CHECKS_JSON HEADS_TXT [--prs PRS_JSON] [--returns RETURNS_JSON]
-                                       [--rules rules/project.json]
-  CHECKS_JSON   output of checks/run_checks.py
-  HEADS_TXT     output of: git ls-remote --heads origin
-  PRS_JSON      output of: gh api repos/<repo>/pulls -X GET -f state=all -f per_page=100  (counts tonight's PRs)
-  RETURNS_JSON  [{"id", "title", "pr", "branch"}]: open row PRs where Adam asked for changes. Code checks each one
-                (the branch must be that row's branch and the PR must be open) and takes the done test from PLAN.md.
-Row branches with no open PR (an earlier run stopped after its push) come back as mode "recover" rows; like new
-rows they open a PR, so they count against the nightly cap. The clock is the machine's, never an argument.
-Prints {"selected": [...], "skipped": [...], "counts": {...}}. Exit 0 ok · 1 bad input.
+Usage: python3 -I tower/select_rows.py [--returns runs/ct/returns.json]
+Code gathers its own evidence, so nothing the AI writes can change the count or the cap:
+  - the exit-check report: python3 -I checks/run_checks.py
+  - the remote's row branches: git ls-remote --heads origin
+  - every PR, open or closed: gh api repos/<repo>/pulls -X GET -f state=all -f per_page=100 (tonight's cap)
+  - the rules: rules/project.json in this checkout (the tower runs detached at origin/main)
+RETURNS: [{"id", "title", "pr", "branch"}]: open row PRs where Adam asked for changes. Code checks each one (the
+branch must be that row's branch and the PR must be open on GitHub) and takes the done test from PLAN.md.
+Row branches with no PR (an earlier run stopped after its push) come back as mode "recover" rows; like new rows
+they open a PR, so they count against the nightly cap. The clock is the machine's, never an argument.
+Prints {"selected": [...], "skipped": [...], "counts": {...}}. Exit 0 ok · 1 bad input · 2 evidence unavailable.
 """
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -158,23 +160,43 @@ def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branche
                        "distance": f"{report['passing']}/{report['total']} exit checks pass"}}
 
 
-def main(argv):
+def gather(root=ROOT, run=subprocess.run):
+    """Collect the evidence with code: rules, the exit-check report, the remote's heads and GitHub's PR list."""
+    rules = json.loads((Path(root) / "rules" / "project.json").read_text(encoding="utf-8"))
+
+    def output(args):
+        proc = run(args, cwd=str(root), capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            raise RuntimeError(f"`{' '.join(args[:3])}` failed: {(proc.stderr or proc.stdout).strip()[-200:]}")
+        return proc.stdout
+
+    report = json.loads(output([sys.executable, "-I", "checks/run_checks.py"]))
+    heads = output(["git", "ls-remote", "--heads", "origin"])
+    prs = json.loads(output(["gh", "api", f"repos/{rules['github_repo']}/pulls", "-X", "GET", "-f", "state=all",
+                             "-f", "per_page=100"]))
+    if not isinstance(prs, list) or not isinstance(report, dict):
+        raise RuntimeError("unexpected evidence shape")
+    return rules, report, heads, prs
+
+
+def main(argv, root=ROOT, run=subprocess.run):
     try:
-        args, opts = list(argv), {}
-        for flag in ("--returns", "--prs", "--rules"):
-            if flag in args:
-                i = args.index(flag)
-                opts[flag] = args[i + 1]
-                del args[i:i + 2]
-        checks_path, heads_path = args
-        report = json.loads(Path(checks_path).read_text(encoding="utf-8"))
-        heads = Path(heads_path).read_text(encoding="utf-8")
-        rules = json.loads(Path(opts.get("--rules", ROOT / "rules" / "project.json")).read_text(encoding="utf-8"))
-        returns = json.loads(Path(opts["--returns"]).read_text(encoding="utf-8")) if "--returns" in opts else []
-        prs = json.loads(Path(opts["--prs"]).read_text(encoding="utf-8")) if "--prs" in opts else []
-    except (OSError, ValueError, KeyError, IndexError) as exc:
+        args = list(argv)
+        returns = []
+        if args[:1] == ["--returns"] and len(args) == 2:
+            returns = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+        elif args:
+            raise ValueError("usage: select_rows.py [--returns FILE]")
+        if not isinstance(returns, list):
+            raise ValueError("returns must be a JSON list")
+    except (OSError, ValueError) as exc:
         print(json.dumps({"error": f"bad input: {exc}"}))
         return 1
+    try:
+        rules, report, heads, prs = gather(root, run)
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(json.dumps({"error": f"evidence unavailable: {exc}"}))
+        return 2
     print(json.dumps(select(report, claimed_ids(heads), rules, returns, prs, None, claimed_branches(heads)), indent=2))
     return 0
 

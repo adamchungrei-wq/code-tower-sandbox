@@ -1,4 +1,5 @@
 import json
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -101,3 +102,62 @@ def test_return_rows_without_a_pr_number_are_rejected():
     ret = [{"id": "E2", "title": "x", "pr": None, "branch": "tower/e2"}]
     out = select_rows.select(report(), {"E2"}, RULES, returns=ret, prs=[], now=NOW)
     assert all(r["source"] != "return" for r in out["selected"])
+
+
+# --- code gathers its own evidence (re-check #3 should-fix 8: an AI-written PR list can't reset the cap) ----------
+class FakeRun:
+    """Stands in for subprocess.run: answers run_checks, git ls-remote and gh api from fixed data."""
+
+    def __init__(self, heads="", prs=(), fail=None):
+        self.heads, self.prs, self.fail, self.calls = heads, list(prs), fail, []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(args)
+        out, rc = "", 0
+        if self.fail and self.fail in " ".join(args):
+            rc = 1
+        elif "checks/run_checks.py" in args:
+            out = json.dumps(report())
+        elif args[:2] == ["git", "ls-remote"]:
+            out = self.heads
+        elif args[:2] == ["gh", "api"]:
+            out = json.dumps(self.prs)
+        return subprocess.CompletedProcess(args, rc, out, "boom" if rc else "")
+
+
+def test_cli_gathers_checks_heads_and_prs_itself(capsys):
+    just_now = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    prs = [{"number": n, "state": "open", "head": {"ref": f"tower/x{n}"}, "created_at": just_now}
+           for n in range(3)]                                     # three row PRs tonight (machine clock): cap reached
+    run = FakeRun(prs=prs)
+    assert select_rows.main([], root=ROOT, run=run) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["selected"] == [] and out["counts"]["prs_last_24h"] == 3
+    assert any(c[:2] == ["gh", "api"] and "state=all" in c for c in run.calls)
+    assert any(c[:3] == ["git", "ls-remote", "--heads"] for c in run.calls)
+
+
+def test_cli_takes_no_ai_supplied_evidence(tmp_path, capsys):
+    fake = tmp_path / "prs.json"
+    fake.write_text("[]")
+    for argv in (["--prs", str(fake)], ["runs/ct/checks.json", "runs/ct/heads.txt"], ["--rules", str(fake)]):
+        assert select_rows.main(argv, root=ROOT, run=FakeRun()) == 1, argv
+        capsys.readouterr()
+
+
+def test_cli_stops_when_evidence_is_unavailable(capsys):
+    for broken in ("gh api", "ls-remote", "run_checks"):
+        assert select_rows.main([], root=ROOT, run=FakeRun(fail=broken)) == 2, broken
+        assert "evidence unavailable" in capsys.readouterr().out
+
+
+def test_cli_return_rows_are_still_checked_against_github(tmp_path, capsys):
+    returns = tmp_path / "returns.json"
+    returns.write_text(json.dumps([{"id": "E1", "title": "x", "pr": 7, "branch": "tower/e1"}]))
+    run = FakeRun(heads="abc\trefs/heads/tower/e1\n", prs=[pr(7, "tower/e1", hours_ago=30)])
+    assert select_rows.main(["--returns", str(returns)], root=ROOT, run=run) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [(r["id"], r["mode"]) for r in out["selected"]][:1] == [("E1", "fix")]
+    run = FakeRun(heads="abc\trefs/heads/tower/e1\n", prs=[pr(7, "tower/e1", hours_ago=30, state="closed")])
+    assert select_rows.main(["--returns", str(returns)], root=ROOT, run=run) == 0
+    assert all(r["mode"] != "fix" for r in json.loads(capsys.readouterr().out)["selected"])

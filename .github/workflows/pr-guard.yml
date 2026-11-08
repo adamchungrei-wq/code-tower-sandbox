@@ -21,7 +21,7 @@ jobs:
         env:
           PR: ${{ github.event.pull_request.number }}
         run: git fetch --no-tags origin "pull/$PR/head:pr-head"
-      - name: Collect files, diff and summary (renames listed as delete + add)
+      - name: Collect files, diff, summary and changed src/ code as data (renames listed as delete + add)
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -29,11 +29,20 @@ jobs:
           git diff --name-only --no-renames "$BASE"...pr-head > "$RUNNER_TEMP/files.txt"
           git diff --no-renames "$BASE"...pr-head > "$RUNNER_TEMP/diff.txt"
           printf '%s' "$PR_BODY" > "$RUNNER_TEMP/body.txt"
-      - name: Check (secrets · loop rules untouched unless Adam labelled it · worker paths · size · summary)
+          mkdir -p "$RUNNER_TEMP/code"
+          grep -E '^src/[A-Za-z0-9_./-]+\.py$' "$RUNNER_TEMP/files.txt" | while read -r f; do
+            if git cat-file -e "pr-head:$f" 2>/dev/null; then
+              mkdir -p "$RUNNER_TEMP/code/$(dirname "$f")"
+              git show "pr-head:$f" > "$RUNNER_TEMP/code/$f"
+            fi
+          done
+      - name: Check (secrets · loop rules untouched unless Adam labelled it · worker paths · size · code · summary)
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          EVENT: ${{ github.event.action }}
         run: >-
           python3 -I .github/scripts/pr_check.py --branch "$HEAD_REF"
           --files "$RUNNER_TEMP/files.txt" --diff "$RUNNER_TEMP/diff.txt"
           --body "$RUNNER_TEMP/body.txt" --rules rules/project.json --labels "$LABELS"
+          --event "$EVENT" --code "$RUNNER_TEMP/code"
