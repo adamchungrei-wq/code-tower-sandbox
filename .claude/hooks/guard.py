@@ -93,7 +93,7 @@ TOKENISH = re.compile(r"[A-Za-z0-9_+/=-]{24,}")     # a long run mixing upper ca
 SESSION_LINK = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9]+")
 SCHEME = re.compile(r"\b(?:https?|ftps?|wss?|data|javascript|vbscript|file|blob)\s*:", re.I)
 LINKS_OK = ("https://app.notion.com/", "https://www.notion.so/", "https://notion.so/",
-            "https://claude.com/claude-code", "https://claude.ai/code/")
+            "https://claude.com/claude-code", "https://claude.ai/code")      # the session's own comment footer
 MAX_TEXT = 30000
 SECRET_PATH = re.compile(
     r"(^|/)(\.env(\.[^/]*)?|[^/]*\.env|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|"

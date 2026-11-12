@@ -22,3 +22,5 @@ You only read: the guard refuses a checker's writes, commits, pushes, comments a
 Type each command exactly as plain words, ONE per call: no `&&`, `;`, `cd`, `$`, `~`, globs or extra options (the fence refuses them). Read files with the Read and Grep tools.
 
 `pass` is true only if items 1, 3, 4 and 5 are met and item 2 has no real problem.
+
+**Supplied rows (id S<number>, C1.5):** they have no exit check, so their done test is a pytest file and never prints "<row id> pass". Judge it by pytest: the done test passes when `python3 -I -m pytest -q <its test file>` exits 0 and the tests really check the point the brief names (not a test that can't fail).
