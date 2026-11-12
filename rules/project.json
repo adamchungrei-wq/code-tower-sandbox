@@ -12,7 +12,7 @@
   "caps": {
     "workers_per_round": 3,
     "rounds_per_run": 2,
-    "draft_prs_per_night": 3,
+    "draft_prs_per_night": 6,
     "asks_per_run": 5,
     "free_form_proposals_per_run": 3,
     "proposals_per_run": 3,
