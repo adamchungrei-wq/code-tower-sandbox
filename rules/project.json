@@ -7,7 +7,7 @@
   "mode": "on",
   "rung": 1,
   "_rung_note": "0 = observe: rows are proposed, no worker runs. 1 = draft: workers open draft PRs; a person approves every merge. 2 = not allowed until Adam rules on evidence (plan §7.3).",
-  "values": {"return": 3, "exit_gap": 3, "follow_up": 2, "free_form": 1},
+  "values": {"return": 3, "exit_gap": 3, "request": 3, "follow_up": 2, "free_form": 1},
   "ai_ready": {"min_value": 2, "max_risk": 1, "needs_done_test": true},
   "caps": {
     "workers_per_round": 3,
@@ -15,6 +15,7 @@
     "draft_prs_per_night": 3,
     "asks_per_run": 5,
     "free_form_proposals_per_run": 3,
+    "proposals_per_run": 3,
     "pr_changed_lines": 200,
     "consecutive_fail_stop": 2,
     "run_minutes": 45,

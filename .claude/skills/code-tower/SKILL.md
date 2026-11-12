@@ -40,27 +40,30 @@ Ported from code-sessions. Kept: Job IDs, the boundaries footer, the fresh check
 ## 1. SENSE (code)
 `python3 -I checks/run_checks.py > runs/ct/checks.json`, then route:
 - Some checks fail → SUPPLY.
-- All pass → the phase's exit test is met. Work nothing new; add one ask: "P<n> passes (evidence: the report). Approve writing the next phase's rows?"
+- All pass → the phase's exit test is met. Add one ask: "P<n> passes (evidence: the report). Approve writing the next phase's rows?" Then go to SUPPLY for supplied rows only (step 2.3).
 - Every failing check is claimed or waits on a person → if `switches.look_ahead` is on, propose up to 3 next-phase rows (proposals only, in the entry). Otherwise end the round with that reason.
 
 ## 2. SUPPLY (rows come from written rules)
 1. **return:** Adam (`requesters`) asked for changes on an open row PR since its last commit. Read `gh api repos/<github_repo>/issues/<n>/comments`. Count only comments with no `<!-- code-tower -->` marker that ask for a change. Write each as `{"id", "title", "pr", "branch"}` to `runs/ct/returns.json`. Code takes the done test from PLAN.md.
 2. **exit_gap:** a failing exit check. SELECT builds these from the report.
-3. **follow_up:** a fixable problem a checker named in an earlier round. For now these go in the entry as proposals.
+3. **Supplied rows (C1.5, Adam 2026-11-11):** read the comments on row PRs, open or merged (`gh api repos/<github_repo>/issues/<n>/comments`). A **follow_up** is a fixable point in a checker's note (a comment starting with `<!-- code-tower -->`); a **request** is a change Adam (`requesters`) asked for on a merged row PR. Write at most `proposals_per_run` as a JSON list to `runs/ct/proposals.json`, one object each:
+   `{"comment_id": <the comment's id>, "title": "<what the row does, plain words>", "files": ["src/textkit/<module>.py", "tests/test_<module>.py"], "test": "tests/test_<module>.py", "lines": <expected changed lines>}`
+   One row per comment. List every file the row will touch; the row's done test is its own test file, which the worker writes. Then pass `--proposals runs/ct/proposals.json` to SELECT.
+   **Code labels each row, not you:** value from the source (`values` in the rules: request 3 = high, follow_up 2 = medium), risk low only when every file is a textkit module, its test file or README.md and the size is under the cap. Only AI-ready rows (value at least medium, risk low) are selected; the rest are skipped with the reason. The guard lets a supplied row push and open a PR only when GitHub confirms its comment.
 
-Free-form ideas: at most `free_form_proposals_per_run`, written in the entry as proposals, never worked. *Why: the loop works only from rules a person approved. It can propose new rules; it never adopts them.*
+Free-form ideas with no such comment: at most `free_form_proposals_per_run`, written in the entry as proposals, never worked. *Why: the loop works only from written rules and sources code can check.*
 
 ## 3. SELECT (code)
-`python3 -I tower/select_rows.py --returns runs/ct/returns.json > runs/ct/select.json` (leave out `--returns runs/ct/returns.json` when there are none). The script gathers its own evidence: it runs the exit checks, lists the remote's row branches, and reads GitHub's PR list for tonight's count, on the machine's clock.
+`python3 -I tower/select_rows.py --returns runs/ct/returns.json --proposals runs/ct/proposals.json > runs/ct/select.json` (leave out either flag and its file when there are none). The script gathers its own evidence: it runs the exit checks, lists the remote's row branches, and reads GitHub's PR list for tonight's count, on the machine's clock.
 
-Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work and counts tonight's PRs from GitHub; the AI that will do the work never picks it, sets its own cap or supplies the evidence. The guard also refuses a draft PR once tonight's cap is reached.*
+Work only `selected`. Show `skipped` with its reasons, and each row's `labels` (value, risk) in the board and the entry. *Why: code picks the work and counts tonight's PRs from GitHub; the AI that will do the work never picks it, sets its own cap or supplies the evidence. The guard also refuses a draft PR once tonight's cap is reached.*
 
 ## 4. DO (workers, in parallel)
 - **Pre-flight first:** `gh api repos/<github_repo> --jq .full_name`, a Notion fetch of the Coordination Entries data source (`rules/project.json` → coordination), and `python3 -I -m pytest --version`. If any fails, stop the round with that reason and start no worker. A missing pytest gets the ask "add `pip install pytest` to this cloud environment's setup script" (round 1, 2026-11-08: workers wrote working code, then stopped at pytest).
 - **Reports come from files.** An agent's final message doesn't always reach the tower. After each worker or checker ends, run `git worktree list`, then Read `<its worktree>/runs/ct/<row id>-report.json` (worker) or `<its worktree>/runs/ct/<row id>-check.json` (checker). No file means no report: treat it as a stop.
 - **Rung 0:** no workers. Log each selected row as "would work" and go to CLOSE. **Rung 1:** continue.
 - Start every selected row in ONE message: one Agent call per row, `subagent_type: worker`, `isolation: worktree`. The brief is one paragraph:
-  `Job <project>-<yyyymmdd>-<row id>. Mode <fresh|fix|recover>. Row <id>: <title>. Source <source>, value <v>. Branch <branch>[, PR #<n>]. Done test: <command> must pass, and python3 -I -m pytest -q must pass. Code under src/, tests under tests/; README.md only for documentation rows. Repo <github_repo>. Policy <sha>. Boundaries unchanged: draft PR only; no merge, no ready, no push except the row branch; no edits to the loop's rules; no secrets; no web; stop and report if access is missing.` For a fix row, add the checker's problems or Adam's comment.
+  `Job <project>-<yyyymmdd>-<row id>. Mode <fresh|fix|recover>. Row <id>: <title>. Source <source>, value <v>. Branch <branch>[, PR #<n>]. Done test: <command> must pass, and python3 -I -m pytest -q must pass. Code under src/, tests under tests/; README.md only for documentation rows. Repo <github_repo>. Policy <sha>. Boundaries unchanged: draft PR only; no merge, no ready, no push except the row branch; no edits to the loop's rules; no secrets; no web; stop and report if access is missing.` For a fix row, add the checker's problems or Adam's comment. For a supplied row (id S<number>), add its source comment's point and its `files`: the worker touches only those files.
 - A worker that stops early gets one `SendMessage`: `Continue <Job> from where you stopped; same boundaries.` A second stop parks the row.
 - **A draft PR refused for the nightly cap, or because the row already has an open PR,** means stop for that row: park it with the guard's reason and start no more new rows.
 - **A push refused by the session's proxy** (an HTTP 403 on `git push`, or "not permitted through this proxy") means this session can't push row branches. Stop every worker. Report the exact error. Add one ask: "switch row_branch_prefix to claude/tower- (a rules PR), or run the tower as a desktop session?"

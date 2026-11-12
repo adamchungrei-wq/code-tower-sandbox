@@ -22,7 +22,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE_RANK = {"return": 0, "exit_gap": 1, "follow_up": 2, "free_form": 3}
+SOURCE_RANK = {"return": 0, "exit_gap": 1, "request": 2, "follow_up": 3, "free_form": 4}
+# C1.5 self-supply (Adam, 2026-11-11): rows the tower proposes from a checker's note or Adam's comment on a row PR.
+# Code verifies the source on GitHub and labels value and risk; only AI-ready (value >= min, low risk) rows run.
+SUPPLY_FILE = re.compile(r"^(?:src/textkit/(?!__init__\.py$)[a-z][a-z0-9_]*\.py|tests/test_[a-z0-9_]+\.py|README\.md)$")
+SUPPLY_TEST = re.compile(r"^tests/test_[a-z0-9_]+\.py$")
+TITLE_CHARS = re.compile(r"[^A-Za-z0-9 :,._()/+=-]")
 ROW_BRANCH = re.compile(r"^(tower/|claude/tower-)([a-z0-9]+)$")
 UNDO = "Close the draft PR and delete the branch."
 MARKER = "<!-- code-tower -->"
@@ -82,6 +87,31 @@ def open_row_prs(prs):
             if pr.get("state") == "open" and ROW_BRANCH.match(((pr.get("head") or {}).get("ref")) or "")}
 
 
+def risk_label(prop, rules):
+    """Code's risk label for a supplied row: (risk, reasons). Low (0) only for new or changed textkit modules, their
+    own test file and README.md, within the size cap; anything else is high (2) and never runs."""
+    files, test, lines = prop.get("files"), prop.get("test"), prop.get("lines")
+    reasons = []
+    if not isinstance(files, list) or not 1 <= len(files) <= 6:
+        reasons.append("files must list 1 to 6 paths")
+    else:
+        bad = [str(f) for f in files if not isinstance(f, str) or not SUPPLY_FILE.match(f)]
+        if bad:
+            reasons.append("touches files outside textkit modules, their tests and README.md: " + ", ".join(bad)[:120])
+    if not (isinstance(test, str) and SUPPLY_TEST.match(test) and isinstance(files, list) and test in files):
+        reasons.append("needs its own test file under tests/, listed in files")
+    cap = int(rules["caps"].get("pr_changed_lines", 200))
+    if not (isinstance(lines, int) and not isinstance(lines, bool) and 1 <= lines <= cap):
+        reasons.append(f"expected size must be 1 to {cap} changed lines")
+    return (0 if not reasons else 2), reasons
+
+
+def labels(row, rules):
+    value = row["value"]
+    return {"value": "high" if value >= 3 else "medium" if value >= rules["ai_ready"]["min_value"] else "low",
+            "risk": "low" if row["risk"] <= rules["ai_ready"]["max_risk"] else "high"}
+
+
 def ai_ready(row, rules):
     gate = rules["ai_ready"]
     return (row["value"] >= gate["min_value"] and row["risk"] <= gate["max_risk"]
@@ -92,7 +122,7 @@ def branch_for(row_id, rules):
     return f"{rules.get('row_branch_prefix', 'tower/')}{row_id.lower()}"
 
 
-def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branches=None, pending=0):
+def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branches=None, pending=0, supplies=()):
     """Pure function: run_checks report, claimed IDs, rules, return rows, the PR list, the time now, and the
     claimed branch names (for recovery)."""
     now = now or datetime.now(timezone.utc)
@@ -157,12 +187,29 @@ def select(report, claimed, rules, returns=(), prs=(), now=None, claimed_branche
                      "depends_on": check.get("depends_on", []), "branch": branch_for(check["id"], rules),
                      "pr": None, "mode": "fresh", "undo": UNDO})
 
+    for sup in supplies:
+        prop, rid = sup["prop"], f"S{sup['comment_id']}"
+        branch = branch_for(rid, rules)
+        if rid in claimed or branch in any_pr:
+            skipped.append({"id": rid, "why": "supplied row already claimed or done"})
+            continue
+        risk, reasons = risk_label(prop, rules)
+        title = TITLE_CHARS.sub("", str(prop.get("title") or ""))[:70].strip() or f"Follow-up from comment {rid[1:]}"
+        rows.append({"id": rid, "title": title, "source": sup["source"], "value": rules["values"][sup["source"]],
+                     "risk": risk, "risk_reasons": reasons, "tier": "T1",
+                     "done_test": f"python3 -I -m pytest -q {prop['test']}" if not reasons else "",
+                     "verifier": "machine", "depends_on": [], "branch": branch, "pr": None, "mode": "fresh",
+                     "undo": UNDO, "comment": sup["comment_id"], "from_pr": sup.get("pr"),
+                     "files": prop.get("files") if not reasons else []})
+
     ready = []
     for row in rows:
+        row["labels"] = labels(row, rules)
         if ai_ready(row, rules):
             ready.append(row)
         else:
-            skipped.append({"id": row["id"], "why": "not AI-ready (value, risk or done test)"})
+            why = "not AI-ready: " + ("; ".join(row.get("risk_reasons") or []) or "value, risk or done test")
+            skipped.append({"id": row["id"], "why": why, "labels": row["labels"]})
     mode_rank = {"fix": 0, "recover": 1, "fresh": 2}
     ready.sort(key=lambda r: (mode_rank[r["mode"]], r["verifier"] != "machine", SOURCE_RANK[r["source"]],
                               -r["value"], r["id"]))
@@ -227,6 +274,8 @@ def verified_returns(returns, rules, root=ROOT, run=subprocess.run):
         return json.loads(proc.stdout)
 
     kept, skipped = [], []
+    if not returns:
+        return kept, skipped
     for ret in returns:
         rid = str(ret.get("id", "?")).upper() if isinstance(ret, dict) else "?"
         try:
@@ -251,16 +300,57 @@ def verified_returns(returns, rules, root=ROOT, run=subprocess.run):
     return kept, skipped
 
 
+def verified_supplies(proposals, rules, root=ROOT, run=subprocess.run):
+    """Check each proposal's source on GitHub: a comment on one of this repo's row PRs, written by the tower (a
+    checker's note, marked) or by a requester. Returns (supplies, skipped). At most proposals_per_run are read."""
+    repo = rules["github_repo"]
+    requesters = {str(r).lower() for r in rules.get("requesters", [])}
+    limit = int(rules["caps"].get("proposals_per_run", rules["caps"].get("free_form_proposals_per_run", 3)))
+    supplies, skipped, seen = [], [], set()
+    for prop in proposals[:limit]:
+        try:
+            cid = int(prop["comment_id"])
+            if cid <= 0 or cid in seen:
+                raise ValueError("duplicate or bad id")
+            seen.add(cid)
+            comment = _api(run, root, f"repos/{repo}/issues/comments/{cid}")
+            number = int(str(comment["issue_url"]).rstrip("/").rsplit("/", 1)[-1])
+            pr = _api(run, root, f"repos/{repo}/pulls/{number}")
+        except (KeyError, TypeError, ValueError, RuntimeError, OSError, subprocess.SubprocessError):
+            skipped.append({"id": f"S{prop.get('comment_id', '?') if isinstance(prop, dict) else '?'}",
+                            "why": "supplied row rejected: its source comment isn't on a row PR in this repo"})
+            continue
+        body, who = str(comment.get("body", "")), str((comment.get("user") or {}).get("login", "")).lower()
+        source = "follow_up" if body.lstrip().startswith(MARKER) else "request" if who in requesters else None
+        if not source or not ROW_BRANCH.match(str((pr.get("head") or {}).get("ref", ""))):
+            skipped.append({"id": f"S{cid}", "why": "supplied row rejected: the source must be a checker note or a "
+                                                    "requester's comment on a row PR"})
+            continue
+        supplies.append({"prop": prop, "source": source, "comment_id": cid, "pr": number})
+    skipped += [{"id": "S?", "why": "over this run's proposal cap"} for _ in proposals[limit:]]
+    return supplies, skipped
+
+
+def _api(run, root, *args):
+    proc = run(["gh", "api", *args], cwd=str(root), capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh api {args[0]} failed")
+    return json.loads(proc.stdout)
+
+
 def main(argv, root=ROOT, run=subprocess.run):
     try:
-        args = list(argv)
-        returns = []
-        if args[:1] == ["--returns"] and len(args) == 2:
-            returns = json.loads(Path(args[1]).read_text(encoding="utf-8"))
-        elif args:
-            raise ValueError("usage: select_rows.py [--returns FILE]")
-        if not isinstance(returns, list):
-            raise ValueError("returns must be a JSON list")
+        args, files = list(argv), {}
+        while args:
+            flag = args.pop(0)
+            if flag not in ("--returns", "--proposals") or flag in files or not args:
+                raise ValueError("usage: select_rows.py [--returns FILE] [--proposals FILE]")
+            files[flag] = json.loads(Path(args.pop(0)).read_text(encoding="utf-8"))
+        returns, proposals = files.get("--returns", []), files.get("--proposals", [])
+        if not isinstance(returns, list) or not isinstance(proposals, list):
+            raise ValueError("returns and proposals must be JSON lists")
+        if not all(isinstance(p, dict) for p in proposals):
+            raise ValueError("each proposal must be a JSON object")
     except (OSError, ValueError) as exc:
         print(json.dumps({"error": f"bad input: {exc}"}))
         return 1
@@ -270,9 +360,10 @@ def main(argv, root=ROOT, run=subprocess.run):
         print(json.dumps({"error": f"evidence unavailable: {exc}"}))
         return 2
     kept, rejected = verified_returns(returns, rules, root, run) if returns else ([], [])
+    supplies, refused = verified_supplies(proposals, rules, root, run) if proposals else ([], [])
     pending = pending_prs(ledger, prs, datetime.now(timezone.utc))
-    out = select(report, claimed_ids(heads), rules, kept, prs, None, claimed_branches(heads), pending)
-    out["skipped"] = rejected + out["skipped"]
+    out = select(report, claimed_ids(heads), rules, kept, prs, None, claimed_branches(heads), pending, supplies)
+    out["skipped"] = rejected + refused + out["skipped"]
     out["counts"]["skipped"] = len(out["skipped"])
     print(json.dumps(out, indent=2))
     return 0
