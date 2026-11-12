@@ -7,7 +7,9 @@ import run_checks
 import select_rows
 
 ROOT = Path(__file__).resolve().parents[2]
-RULES = json.loads((ROOT / "rules" / "project.json").read_text(encoding="utf-8"))
+FILE_RULES = json.loads((ROOT / "rules" / "project.json").read_text(encoding="utf-8"))
+CAP = FILE_RULES["caps"]["draft_prs_per_night"]                 # the CLI tests read the real file
+RULES = dict(FILE_RULES, caps=dict(FILE_RULES["caps"], draft_prs_per_night=3))   # unit tests pin a cap of 3
 PLAN_CHECKS = run_checks.load_block((ROOT / "PLAN.md").read_text(encoding="utf-8"))["checks"]
 NOW = datetime(2026, 11, 8, 3, 0, tzinfo=timezone.utc)
 
@@ -139,11 +141,11 @@ class FakeRun:
 def test_cli_gathers_checks_heads_and_prs_itself(capsys):
     just_now = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     prs = [{"number": n, "state": "open", "head": {"ref": f"tower/x{n}"}, "created_at": just_now}
-           for n in range(3)]                                     # three row PRs tonight (machine clock): cap reached
+           for n in range(CAP)]                                   # the cap's worth of row PRs tonight: cap reached
     run = FakeRun(prs=prs)
     assert select_rows.main([], root=ROOT, run=run) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["selected"] == [] and out["counts"]["prs_last_24h"] == 3
+    assert out["selected"] == [] and out["counts"]["prs_last_24h"] == CAP
     assert any(c[:2] == ["gh", "api"] and "state=all" in c for c in run.calls)
     assert any(c[:3] == ["git", "ls-remote", "--heads"] for c in run.calls)
 
@@ -166,10 +168,10 @@ def test_prs_the_guard_allowed_count_until_github_lists_them():
 def test_cli_counts_the_guards_ledger(tmp_path, capsys):
     just_now = datetime.now(timezone.utc) - timedelta(minutes=2)
     (tmp_path / "code-tower-prs.json").write_text(json.dumps(
-        [{"head": f"tower/e{n}", "row": f"E{n}", "at": just_now.isoformat()} for n in (1, 2)]))
+        [{"head": f"tower/x{n}", "row": f"X{n}", "at": just_now.isoformat()} for n in range(CAP - 1)]))
     assert select_rows.main([], root=ROOT, run=FakeRun(common=str(tmp_path))) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["counts"]["prs_last_24h"] == 2 and ids(out["selected"]) == ["E1"]
+    assert out["counts"]["prs_last_24h"] == CAP - 1 and ids(out["selected"]) == ["E1"]
     assert select_rows.main([], root=ROOT, run=FakeRun(common="relative/dir")) == 0      # never a relative path
     assert json.loads(capsys.readouterr().out)["counts"]["prs_last_24h"] == 0
 
