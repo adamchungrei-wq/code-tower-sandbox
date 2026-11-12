@@ -378,6 +378,21 @@ def _write_refused(path, cwd, env, live=True):
     return f"{rel}: the tower writes only runs/ct/; workers write src/, tests/ and README.md in their own worktree"
 
 
+def _checker_write(tool, path, cwd, env, live):
+    """A checker only reads, except its verdict file: runs/ct/<row>-check.json in its own worktree. (Round 1,
+    2026-11-08: an agent's final message didn't reach the tower, so verdicts and reports also go to a file.)"""
+    no = (False, "a checker only reads, except its verdict: Write runs/ct/<row id>-check.json in your own worktree")
+    if tool != "Write" or not path:
+        return no
+    why = _write_refused(path, cwd, env, live=False)
+    full = _full(path, cwd, env)
+    top = env.toplevel(full)
+    if why or not top or os.path.realpath(top) == os.path.realpath(env.project_dir or top):
+        return no
+    rel = os.path.relpath(full, top).replace("\\", "/")
+    return (True, "verdict") if re.fullmatch(r"runs/ct/[A-Za-z0-9_-]{1,20}-check\.json", rel) else no
+
+
 def _read_refused(path, cwd, env):
     full = _full(path, cwd, env)
     if SECRET_PATH.search(full) or SECRET_PATH.search(path):
@@ -487,7 +502,7 @@ FORMS = (   # (name, form, may redirect stdout to runs/ct/<file>.json|txt, extra
     ("run checks", rf"python3 -I checks/run_checks\.py(?: --only {ID})?(?: --strict)?", True, ""),
     ("check", r"python3 -I checks/[a-z0-9_]{1,40}\.py", False, ""),
     ("select", r"python3 -I tower/select_rows\.py(?: --returns runs/ct/returns\.json)?", True, ""),
-    ("pytest", rf"python3 -I -m pytest(?: (?:-q|-x|-v|-vv|-rA|--tb=(?:short|line|no)|{TESTPATH})){{0,8}}", False, ""),
+    ("pytest", rf"python3 -I -m pytest(?: --version| (?:-q|-x|-v|-vv|-rA|--tb=(?:short|line|no)|{TESTPATH})){{0,8}}", False, ""),
     ("ls", rf"ls(?: -[al1AFh]{{1,5}}){{0,2}}(?: {REL}){{0,10}}", False, "read"),
     ("read", rf"(?:cat|wc -l|(?:head|tail) (?:-n [0-9]{{1,4}}|-[0-9]{{1,4}})) {REL}(?: {REL}){{0,10}}", False, "read"),
     ("gh auth", r"gh auth status", False, ""),
@@ -798,9 +813,9 @@ def decide(tool, inp, cwd, env=None):
         return True, "read"
     live = _live(env, cwd)
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-        if env.agent_type == "checker":
-            return block("a checker only reads; its verdict is its final message")
         path = str(inp.get("file_path") or inp.get("notebook_path") or "")
+        if env.agent_type == "checker":
+            return _checker_write(tool, path, cwd, env, live)
         why = _write_refused(path, cwd, env, live) if path else "no path"
         return (False, why) if why else (True, "file")
     if tool == "Bash":
