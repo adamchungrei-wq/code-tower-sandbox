@@ -29,6 +29,10 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
         run: |
           ID=$(printf '%s' "$HEAD_REF" | sed -E 's#^(tower/|claude/tower-)##' | tr '[:lower:]' '[:upper:]')
-          python3 -I checks/run_checks.py --only "$ID" --strict
+          if printf '%s' "$ID" | grep -Eq '^S[0-9]+$'; then
+            echo "$ID is a supplied row (C1.5): no exit check; its own test ran in the full suite above"
+          else
+            python3 -I checks/run_checks.py --only "$ID" --strict
+          fi
       - name: Exit-check report (information only)
         run: python3 -I checks/run_checks.py
