@@ -56,7 +56,8 @@ Free-form ideas: at most `free_form_proposals_per_run`, written in the entry as 
 Work only `selected`. Show `skipped` with its reasons. *Why: code picks the work and counts tonight's PRs from GitHub; the AI that will do the work never picks it, sets its own cap or supplies the evidence. The guard also refuses a draft PR once tonight's cap is reached.*
 
 ## 4. DO (workers, in parallel)
-- **Pre-flight first:** `gh api repos/<github_repo> --jq .full_name`, and a Notion fetch of the Coordination Entries data source (`rules/project.json` → coordination). If either fails, stop the round with that reason; start no worker.
+- **Pre-flight first:** `gh api repos/<github_repo> --jq .full_name`, a Notion fetch of the Coordination Entries data source (`rules/project.json` → coordination), and `python3 -I -m pytest --version`. If any fails, stop the round with that reason and start no worker. A missing pytest gets the ask "add `pip install pytest` to this cloud environment's setup script" (round 1, 2026-11-08: workers wrote working code, then stopped at pytest).
+- **Reports come from files.** An agent's final message doesn't always reach the tower. After each worker or checker ends, run `git worktree list`, then Read `<its worktree>/runs/ct/<row id>-report.json` (worker) or `<its worktree>/runs/ct/<row id>-check.json` (checker). No file means no report: treat it as a stop.
 - **Rung 0:** no workers. Log each selected row as "would work" and go to CLOSE. **Rung 1:** continue.
 - Start every selected row in ONE message: one Agent call per row, `subagent_type: worker`, `isolation: worktree`. The brief is one paragraph:
   `Job <project>-<yyyymmdd>-<row id>. Mode <fresh|fix|recover>. Row <id>: <title>. Source <source>, value <v>. Branch <branch>[, PR #<n>]. Done test: <command> must pass, and python3 -I -m pytest -q must pass. Code under src/, tests under tests/; README.md only for documentation rows. Repo <github_repo>. Policy <sha>. Boundaries unchanged: draft PR only; no merge, no ready, no push except the row branch; no edits to the loop's rules; no secrets; no web; stop and report if access is missing.` For a fix row, add the checker's problems or Adam's comment.
@@ -76,7 +77,7 @@ For each worker result:
    - `git diff origin/main...origin/<branch>`
    - the PR summary
  
-   Never give it the worker's reasoning. Its final message is the verdict JSON: save it with the Write tool to `runs/ct/<id>-check.json`.
+   Never give it the worker's reasoning. It writes its verdict to `runs/ct/<id>-check.json` in its own worktree; read that file (or its final message), then save a copy with the Write tool to your own `runs/ct/<id>-check.json`.
 4. **Pass** means every check-run concluded `success` AND the checker passed. Then write `runs/ct/<id>-note.md` (first line `<!-- code-tower -->`, then the checker's `review_note`) and post it as a comment.
 5. **Fail:** one fix round (a new worker in fix mode with the checker's problems), then a new checker. A second fail parks the row: post a comment starting with the marker, saying `Parked: <reason>`, and add an ask.
 

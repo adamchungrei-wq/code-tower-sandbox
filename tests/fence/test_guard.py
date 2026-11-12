@@ -258,6 +258,11 @@ def test_outward_actions_need_main_fetched_in_the_last_ten_minutes():
     assert bash("git push -u origin HEAD:refs/heads/tower/e1", StubEnv(fetch_age=599))
 
 
+def test_preflight_can_ask_whether_pytest_is_installed():
+    assert bash("python3 -I -m pytest --version")
+    assert not bash("python3 -I -m pytest --version --co")
+
+
 def test_a_checker_only_reads():
     # re-check #5 nit 7f: the guard couldn't tell a checker from a worker; the hook input names the agent type
     checker = StubEnv(files=CLEAN, agent_type="checker")
@@ -266,6 +271,13 @@ def test_a_checker_only_reads():
                 f"gh api repos/{REPO}/issues/3/comments -X POST -F body=@runs/ct/E1-note.md"):
         assert not ok("Bash", {"command": cmd}, checker, cwd=W), cmd
     assert not ok("Write", {"file_path": f"{W}/src/x.py"}, checker, cwd=W)
+    # round 1 (2026-11-08): final messages didn't reach the tower, so the verdict also goes to one file
+    assert ok("Write", {"file_path": f"{W}/runs/ct/E1-check.json", "content": "{}"}, checker, cwd=W)
+    for path in (f"{W}/runs/ct/E1-note.md", f"{W}/runs/ct/x/E1-check.json", "/repo/runs/ct/E1-check.json",
+                 f"{W}/tests/E1-check.json"):
+        assert not ok("Write", {"file_path": path, "content": "{}"}, checker, cwd=W), path
+    assert not ok("Edit", {"file_path": f"{W}/runs/ct/E1-check.json", "old_string": "a", "new_string": "b"},
+                  checker, cwd=W)
     assert not ok("Agent", {"subagent_type": "worker", "isolation": "worktree", "prompt": "x"}, checker)
     for cmd in ("git fetch origin refs/heads/tower/e1:refs/remotes/origin/tower/e1", "git switch --detach origin/tower/e1",
                 "python3 -I checks/e1_slugify.py", "python3 -I -m pytest -q", "git diff --stat origin/main...HEAD"):

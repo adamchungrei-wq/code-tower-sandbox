@@ -55,5 +55,7 @@ Never:
 
 The guard blocks most of these; don't probe it.
 
-End with ONE JSON object as your final message:
+If `python3 -I -m pytest` says "No module named pytest", stop and report `stopped_because: "pytest missing"`. Don't install anything.
+
+Before you finish, ALWAYS write your report with the Write tool to `runs/ct/<row id>-report.json` in your own worktree (also when you stop early): the tower reads that file, because an agent's final message doesn't always reach it. Then end with the same JSON object as your final message:
 `{"row": "<id>", "mode": "fresh|fix|recover", "branch": "...", "pr": <number or null>, "done_test": "pass|fail", "pytest": "pass|fail", "changed_lines": N, "files": ["..."], "stopped_because": null}`
