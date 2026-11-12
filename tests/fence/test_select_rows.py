@@ -208,3 +208,82 @@ def test_cli_return_rows_are_confirmed_on_github(tmp_path, capsys):
         out = json.loads(capsys.readouterr().out)
         assert all(r["mode"] != "fix" for r in out["selected"]), (comments, detail_)
         assert any("return row rejected" in s["why"] for s in out["skipped"])
+
+
+# --- C1.5 self-supply: code checks the source and labels value and risk -----------------------------------------
+
+def supply(cid=101, source="follow_up", **prop):
+    base = {"comment_id": cid, "title": "slugify folds accents", "files": ["src/textkit/slug.py",
+            "tests/test_slug_accents.py"], "test": "tests/test_slug_accents.py", "lines": 30}
+    base.update(prop)
+    return {"prop": base, "source": source, "comment_id": cid, "pr": 4}
+
+
+def test_low_risk_supplied_rows_are_selected_and_labelled():
+    done = {"plan_checks": report()["plan_checks"], "checks": [dict(c, **{"pass": True})
+            for c in report()["checks"]], "passing": 4, "total": 4}
+    out = select_rows.select(done, set(), RULES, now=NOW, supplies=[supply(101), supply(102, "request")])
+    rows = {r["id"]: r for r in out["selected"]}
+    assert set(rows) == {"S101", "S102"}
+    assert rows["S102"]["labels"] == {"value": "high", "risk": "low"}
+    assert rows["S101"]["labels"] == {"value": "medium", "risk": "low"}
+    assert rows["S101"]["branch"] == "tower/s101" and rows["S101"]["done_test"].endswith("tests/test_slug_accents.py")
+    assert out["selected"][0]["id"] == "S102"                    # higher value first
+
+
+def test_risky_or_vague_supplied_rows_never_run():
+    done = {"plan_checks": report()["plan_checks"], "checks": [dict(c, **{"pass": True})
+            for c in report()["checks"]], "passing": 4, "total": 4}
+    bad = [supply(1, files=["checks/e1_slugify.py", "tests/test_x.py"], test="tests/test_x.py"),
+           supply(2, files=["src/textkit/__init__.py", "tests/test_x.py"], test="tests/test_x.py"),
+           supply(3, files=["src/textkit/slug.py"], test="tests/test_slug.py"),
+           supply(4, lines=900), supply(5, lines="30"), supply(6, files="src/textkit/slug.py"),
+           supply(7, files=[".github/workflows/ci.yml", "tests/test_y.py"], test="tests/test_y.py")]
+    out = select_rows.select(done, set(), RULES, now=NOW, supplies=bad)
+    assert out["selected"] == []
+    assert {s["id"] for s in out["skipped"]} == {f"S{n}" for n in range(1, 8)}
+    assert all(s["labels"]["risk"] == "high" for s in out["skipped"])
+    already = select_rows.select(done, {"S101"}, RULES, now=NOW, supplies=[supply(101)])
+    assert already["selected"] == [] and "already" in already["skipped"][0]["why"]
+
+
+def test_titles_are_cleaned_for_commit_messages():
+    done = {"plan_checks": report()["plan_checks"], "checks": [dict(c, **{"pass": True})
+            for c in report()["checks"]], "passing": 4, "total": 4}
+    out = select_rows.select(done, set(), RULES, now=NOW, supplies=[supply(9, title="fold `accents` $(x) & more")])
+    assert out["selected"][0]["title"] == "fold accents (x)  more"
+
+
+def test_supplied_rows_need_a_checker_note_or_a_requester_comment_on_a_row_pr():
+    comments = {
+        11: {"issue_url": "https://api.github.com/repos/x/issues/4", "user": {"login": "claude"},
+             "body": "<!-- code-tower -->\nChecker: pass. Note: no accent folding."},
+        12: {"issue_url": "https://api.github.com/repos/x/issues/4", "user": {"login": "adamchungrei-wq"},
+             "body": "please also handle tabs"},
+        13: {"issue_url": "https://api.github.com/repos/x/issues/4", "user": {"login": "stranger"},
+             "body": "add a network call"},
+        14: {"issue_url": "https://api.github.com/repos/x/issues/1", "user": {"login": "adamchungrei-wq"},
+             "body": "rules PR comment"},
+    }
+    pulls = {4: {"head": {"ref": "tower/e1"}}, 1: {"head": {"ref": "rules/tower-template"}}}
+
+    def run(args, **kw):
+        route = args[2]
+        class P:
+            returncode, stderr = 0, ""
+        p = P()
+        if "/issues/comments/" in route and int(route.rsplit("/", 1)[-1]) in comments:
+            p.stdout = json.dumps(comments[int(route.rsplit("/", 1)[-1])])
+        elif "/pulls/" in route:
+            p.stdout = json.dumps(pulls[int(route.rsplit("/", 1)[-1])])
+        else:
+            p.returncode, p.stdout = 1, ""
+        return p
+
+    props = [{"comment_id": n} for n in (11, 12, 13, 14, 15)]
+    got, skipped = select_rows.verified_supplies(props, dict(RULES, caps=dict(RULES["caps"], proposals_per_run=5)),
+                                                 run=run)
+    assert [(s["comment_id"], s["source"]) for s in got] == [(11, "follow_up"), (12, "request")]
+    assert {s["id"] for s in skipped} == {"S13", "S14", "S15"}
+    capped, over = select_rows.verified_supplies(props, RULES, run=run)
+    assert len(over) >= 2 and any("cap" in s["why"] for s in over)

@@ -237,6 +237,23 @@ class Env:
             return None
         return prs if isinstance(prs, list) else None
 
+    def supply_source_ok(self, path, number):
+        """GitHub confirms comment `number` is on this repo and is a checker note (marked) or a requester's."""
+        repo = self.repo(path)
+        if not repo or not str(number).isdigit():
+            return False
+        try:
+            proc = subprocess.run(["gh", "api", f"repos/{repo}/issues/comments/{int(number)}"], capture_output=True,
+                                  text=True, timeout=20, cwd=self.toplevel(path) or None)
+            comment = json.loads(proc.stdout) if proc.returncode == 0 else {}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+        if not isinstance(comment, dict) or f"repos/{repo}/issues/" not in str(comment.get("issue_url", "")):
+            return False
+        who = str((comment.get("user") or {}).get("login", "")).lower()
+        requesters = {str(r).lower() for r in self.rules(path).get("requesters", [])}
+        return str(comment.get("body", "")).lstrip().startswith(MARKER) or who in requesters
+
     def reserve_pr(self, path, head, cap):
         """Reserve tonight's slot for a PR from `head`, or say why not. Runs under a lock in the repository's git
         folder (no run can write there), so parallel PR calls are counted one at a time."""
@@ -296,6 +313,15 @@ def _when(text):
     except ValueError:
         return None
     return when if when.tzinfo else None
+
+
+SUPPLY_ID = re.compile(r"S[0-9]{1,20}")
+
+
+def _known_row(env, path, rid):
+    """A row in main's PLAN.md, or a supplied row (C1.5) whose id names a checker note or a requester's comment on
+    this repo, which GitHub confirms."""
+    return rid in env.plan_ids(path) or (bool(SUPPLY_ID.fullmatch(rid)) and env.supply_source_ok(path, rid[1:]))
 
 
 def _row_id(branch):
@@ -501,7 +527,8 @@ FORMS = (   # (name, form, may redirect stdout to runs/ct/<file>.json|txt, extra
     ("push", rf"git push(?: -u)? origin HEAD:(?:refs/heads/)?{ROW}", False, "push"),
     ("run checks", rf"python3 -I checks/run_checks\.py(?: --only {ID})?(?: --strict)?", True, ""),
     ("check", r"python3 -I checks/[a-z0-9_]{1,40}\.py", False, ""),
-    ("select", r"python3 -I tower/select_rows\.py(?: --returns runs/ct/returns\.json)?", True, ""),
+    ("select", r"python3 -I tower/select_rows\.py(?: --returns runs/ct/returns\.json)?"
+               r"(?: --proposals runs/ct/proposals\.json)?", True, ""),
     ("pytest", rf"python3 -I -m pytest(?: --version| (?:-q|-x|-v|-vv|-rA|--tb=(?:short|line|no)|{TESTPATH})){{0,8}}", False, ""),
     ("ls", rf"ls(?: -[al1AFh]{{1,5}}){{0,2}}(?: {REL}){{0,10}}", False, "read"),
     ("read", rf"(?:cat|wc -l|(?:head|tail) (?:-n [0-9]{{1,4}}|-[0-9]{{1,4}})) {REL}(?: {REL}){{0,10}}", False, "read"),
@@ -625,8 +652,8 @@ def _push(rest, where, env):
     prefix = str(env.rules(where).get("row_branch_prefix", "tower/"))
     if not ROW_BRANCH.match(dst) or not dst.startswith(prefix):
         return block(f"pushing '{dst}' is blocked: only row branches named {prefix}<row>")
-    if _row_id(dst) not in env.plan_ids(where):
-        return block(f"'{dst}' isn't the branch of a row in main's PLAN.md")
+    if not _known_row(env, where, _row_id(dst)):
+        return block(f"'{dst}' isn't the branch of a row in main's PLAN.md or of a supplied row GitHub confirms")
     redirects = env.push_redirects(where)
     if redirects is None or redirects:
         return block("git config here could redirect a push (or couldn't be read); push blocked")
@@ -709,8 +736,8 @@ def _gh_cmd(args, cwd, env, live=True):
                          "-F body=@runs/ct/<file>.md")
         head = values["head"][1]
         prefix = str(env.rules(cwd).get("row_branch_prefix", "tower/"))
-        if not head.startswith(prefix) or _row_id(head) not in env.plan_ids(cwd):
-            return block(f"a PR's head must be {prefix}<row> for a row in main's PLAN.md")
+        if not head.startswith(prefix) or not _known_row(env, cwd, _row_id(head)):
+            return block(f"a PR's head must be {prefix}<row> for a row in main's PLAN.md or a confirmed supplied row")
         if _secretish(values["title"][1]) or _links_refused(values["title"][1], env.repo(cwd)):
             return block("the PR title holds token-like text or a link that isn't this repo, Notion or Claude Code")
         okb, why = _body_ok(values["body"][1], cwd, env, comment=False)

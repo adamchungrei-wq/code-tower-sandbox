@@ -51,6 +51,9 @@ class StubEnv(guard.Env):
     def plan_ids(self, path):
         return set(PLAN_IDS)
 
+    def supply_source_ok(self, path, number):
+        return number in getattr(self, "comments", {"4242"})
+
     def reserve_pr(self, path, head, cap):
         if self.prs_tonight is None:
             return "couldn't read tonight's PRs on GitHub"
@@ -777,3 +780,15 @@ def test_hook_exit_codes(payload, code):
     run = subprocess.run([sys.executable, "-I", str(hook)], input=payload, text=True, capture_output=True,
                          env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)})
     assert run.returncode == code, run.stderr
+
+
+def test_supplied_rows_push_and_open_prs_only_when_github_confirms_their_comment():
+    # C1.5 (Adam, 2026-11-11): rows the tower supplies from a checker note or Adam's comment
+    env = StubEnv(files=CLEAN)
+    assert bash("git push -u origin HEAD:refs/heads/tower/s4242", env)
+    assert bash(PR.replace("head=tower/e1", "head=tower/s4242"), env)
+    for branch in ("tower/s999", "tower/s", "tower/sx42", "tower/z4242"):
+        assert not bash(f"git push -u origin HEAD:refs/heads/{branch}", env), branch
+    assert bash("python3 -I tower/select_rows.py --returns runs/ct/returns.json --proposals runs/ct/proposals.json")
+    assert bash("python3 -I tower/select_rows.py --proposals runs/ct/proposals.json")
+    assert not bash("python3 -I tower/select_rows.py --proposals /tmp/p.json")

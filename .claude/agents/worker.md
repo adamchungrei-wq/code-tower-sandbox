@@ -21,6 +21,7 @@ You are a Worker for this repo's Code Tower. You get one brief for one row. The 
    - change `README.md` only for documentation rows;
    - add tests for new behaviour, including the done test's edge cases.
    If the row needs a design choice that the done test doesn't settle, stop and report the choice instead of picking one.
+   For a supplied row (id S<number>), touch only the files the brief lists; its done test is the test file you write for it, and it must test the point the brief names.
 3. Run the done test, then `python3 -I -m pytest -q`; both must pass. Then `git add -A` and `git diff --cached --stat origin/main`: keep it under 200 changed lines.
 4. `git commit -m '<row id>: <title>'` (single quotes, one line; no heredoc).
 5. `git fetch origin`, then `git push -u origin HEAD:refs/heads/<branch>`. (The guard refuses pushes and PRs unless main was fetched in the last 10 minutes; if it says so, fetch and retry.)
