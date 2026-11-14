@@ -11,6 +11,17 @@ python3 -I -m pytest -q             # tests
 python3 -I checks/run_checks.py     # which exit checks pass
 ```
 
+## Usage
+
+```python
+from textkit import normalize_whitespace, slugify, word_count, truncate
+
+normalize_whitespace("  hello   big\n world ")  # "hello big world"
+slugify("Hello, World!")                        # "hello-world"
+word_count("one two  three")                    # 3
+truncate("hello world", 6)                      # "hello…"
+```
+
 ## Start the tower
 
 Open a Claude Code session on this repo and say "run the tower". It runs one round (see `.claude/skills/code-tower/SKILL.md`) and reports a board, any asks, and its draft PRs.
