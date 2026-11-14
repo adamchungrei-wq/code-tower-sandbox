@@ -14,6 +14,10 @@ import textkit
         ("", ""),
         ("a__b", "a-b"),
         ("Tab\tand\nnewline", "tab-and-newline"),
+        ("Café Déjà", "cafe-deja"),
+        ("Café Déjà", "cafe-deja"),
+        ("Über Ångström ñ", "uber-angstrom-n"),
+        ("éé", "ee"),
     ],
 )
 def test_slugify(text, want):
