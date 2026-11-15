@@ -10,7 +10,7 @@ PLAN = (ROOT / "PLAN.md").read_text(encoding="utf-8")
 
 def test_plan_block_is_valid_and_every_command_is_runnable():
     data = run_checks.load_block(PLAN)
-    assert [c["id"] for c in data["checks"]] == ["E1", "E2", "E3", "E4"]
+    assert [c["id"] for c in data["checks"]][:4] == ["E1", "E2", "E3", "E4"]         # later phases add rows
     assert all(run_checks.SAFE_COMMAND.match(c["command"]) for c in data["checks"])
     for check in data["checks"]:
         script = ROOT / check["command"].split()[-1]
@@ -61,4 +61,4 @@ def test_only_one_check(tmp_path):
 
 def test_report_covers_every_check():
     out = run_checks.report(PLAN, root=ROOT)
-    assert out["total"] == 4 and len(out["checks"]) == 4
+    assert out["total"] == len(out["checks"]) == len(run_checks.load_block(PLAN)["checks"]) >= 4
