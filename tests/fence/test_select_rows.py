@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FILE_RULES = json.loads((ROOT / "rules" / "project.json").read_text(encoding="utf-8"))
 CAP = FILE_RULES["caps"]["draft_prs_per_night"]                 # the CLI tests read the real file
 RULES = dict(FILE_RULES, caps=dict(FILE_RULES["caps"], draft_prs_per_night=3))   # unit tests pin a cap of 3
-PLAN_CHECKS = run_checks.load_block((ROOT / "PLAN.md").read_text(encoding="utf-8"))["checks"]
+PLAN_CHECKS = [c for c in run_checks.load_block((ROOT / "PLAN.md").read_text(encoding="utf-8"))["checks"]
+               if c["id"] in ("E1", "E2", "E3", "E4")]                 # the unit tests use phase P1's four rows
 NOW = datetime(2026, 11, 8, 3, 0, tzinfo=timezone.utc)
 
 
