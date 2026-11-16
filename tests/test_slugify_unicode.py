@@ -8,7 +8,7 @@ import textkit
     [
         ("Hello, World!", "hello-world"),
         ("Café Déjà", "café-déjà"),
-        ("Café", "café"),
+        ("Café", "café"),
         ("Привет, мир!", "привет-мир"),
         ("日本語 テキスト", "日本語-テキスト"),
         ("हिन्दी भाषा", "हिन्दी-भाषा"),
@@ -17,9 +17,14 @@ import textkit
         ("  -- x --  ", "x"),
         ("---", ""),
         ("", ""),
+        ("İ", "i̇"),
+        ("İstanbul", "i̇stanbul"),
+        ("Aİ B", "ai̇-b"),
+        ("Café", "café"),
     ],
 )
 def test_slugify_unicode(text, want):
     got = textkit.slugify_unicode(text)
     assert type(got) is str
     assert got == want
+    assert textkit.slugify_unicode(got) == got
