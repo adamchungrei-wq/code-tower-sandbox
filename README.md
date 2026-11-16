@@ -14,12 +14,14 @@ python3 -I checks/run_checks.py     # which exit checks pass
 ## Usage
 
 ```python
-from textkit import normalize_whitespace, slugify, word_count, truncate
+from textkit import normalize_whitespace, slugify, word_count, truncate, slugify_unicode, run_command
 
 normalize_whitespace("  hello   big\n world ")  # "hello big world"
 slugify("Hello, World!")                        # "hello-world"
 word_count("one two  three")                    # 3
 truncate("hello world", 6)                      # "hello…"
+slugify_unicode("Crème Brûlée!")                # "crème-brûlée"
+run_command(["word-count", "one two  three"])   # "3"
 ```
 
 ## Start the tower
