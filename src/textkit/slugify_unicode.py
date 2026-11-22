@@ -7,7 +7,7 @@ __all__ = ["slugify_unicode"]
 
 def slugify_unicode(text: str) -> str:
     """Lowercase, keep letters, digits and combining marks of any script, join runs with single hyphens."""
-    normal = unicodedata.normalize("NFC", text).lower()
+    normal = unicodedata.normalize("NFC", unicodedata.normalize("NFC", text).lower())
     parts = []
     current = []
     for ch in normal:
